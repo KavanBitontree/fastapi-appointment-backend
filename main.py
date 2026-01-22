@@ -9,11 +9,6 @@ app.include_router(router)
 @app.get("/")
 async def hello():
     return {"message": "Hello, World!"}
-app.include_router(router)
-
-@app.get("/")
-async def hello():
-    return {"message": "Hello, World!"}
 
 
 if __name__ == "__main__":

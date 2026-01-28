@@ -1,9 +1,16 @@
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
-from alembic import context
 
 from core.config import settings
 from core.database import Base
+from alembic import context
+from models.user import User
+from models.doctor import Doctor
+from models.patient import Patient
+from models.device import Device
+from models.refresh_token import RefreshToken
+
+
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.NEON_DB_URL)

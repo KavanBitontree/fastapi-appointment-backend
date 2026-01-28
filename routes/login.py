@@ -1,7 +1,6 @@
 from datetime import datetime, timedelta
-from fastapi import APIRouter, HTTPException, status, Depends, Request
+from fastapi import APIRouter, HTTPException, status, Depends, Request, Response
 from sqlalchemy.orm import Session
-from schemas.login import LoginRequest, RefreshTokenRequest, AuthResponse, MessageResponse
 import secrets
 import hashlib
 
@@ -11,14 +10,11 @@ from models.device import Device
 from models.refresh_token import RefreshToken
 from services.security import verify_password, create_access_token
 from middlewares.auth import auth_required
+from schemas.login import LoginRequest, MessageResponse
+
 from core.security_schemes import bearer_scheme
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
-
-
-def generate_device_fingerprint() -> str:
-    """Generate a dummy device fingerprint for testing"""
-    return hashlib.sha256(secrets.token_bytes(32)).hexdigest()
 
 
 def create_refresh_token_for_device(user_id: int, device_id: int, db: Session) -> str:
@@ -42,12 +38,10 @@ def create_refresh_token_for_device(user_id: int, device_id: int, db: Session) -
 
 def revoke_all_user_sessions(user_id: int, db: Session):
     """Revoke all refresh tokens and deactivate all devices for a user"""
-    # Revoke all refresh tokens
     db.query(RefreshToken).filter(
         RefreshToken.user_id == user_id
     ).update({"revoked": True})
     
-    # Deactivate all devices
     db.query(Device).filter(
         Device.user_id == user_id
     ).update({"is_active": False})
@@ -55,16 +49,52 @@ def revoke_all_user_sessions(user_id: int, db: Session):
     db.commit()
 
 
-@router.post("/login", response_model=AuthResponse)
+@router.get("/check-session")
+async def check_session(
+    email: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Check if user has active sessions on other devices
+    Returns device info if sessions exist
+    """
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        return {"has_active_session": False}
+    
+    # Get active devices
+    active_devices = db.query(Device).filter(
+        Device.user_id == user.id,
+        Device.is_active == True
+    ).all()
+    
+    if not active_devices:
+        return {"has_active_session": False}
+    
+    # Return the most recent active device
+    latest_device = max(active_devices, key=lambda d: d.last_login_at)
+    
+    return {
+        "has_active_session": True,
+        "device_model": latest_device.device_model,
+        "last_login_at": latest_device.last_login_at.isoformat()
+    }
+
+
+@router.post("/login")
 async def login(
     request: LoginRequest,
+    response: Response,
+    device_fingerprint: str = None,
+    device_model: str = None,
+    force_login: bool = False,
     db: Session = Depends(get_db)
 ):
     """
     Login endpoint with single-session enforcement
-    - Revokes all existing sessions for the user
+    - Revokes all existing sessions for the user (if force_login=True)
     - Creates new device and session
-    - Returns access token and refresh token
+    - Returns access token in JSON, refresh token in HttpOnly cookie
     """
     # 1. Find user
     user = db.query(User).filter(User.email == request.email).first()
@@ -88,25 +118,43 @@ async def login(
             detail="Account is deactivated"
         )
     
+    # 4. Check for existing active sessions (if not force_login)
+    if not force_login:
+        active_devices = db.query(Device).filter(
+            Device.user_id == user.id,
+            Device.is_active == True
+        ).all()
+        
+        if active_devices:
+            latest_device = max(active_devices, key=lambda d: d.last_login_at)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "Already logged in from another device",
+                    "device_model": latest_device.device_model,
+                    "last_login_at": latest_device.last_login_at.isoformat()
+                }
+            )
+    
     try:
-        # 4. ENFORCE SINGLE SESSION: Revoke all existing sessions
+        # 5. ENFORCE SINGLE SESSION: Revoke all existing sessions
         revoke_all_user_sessions(user.id, db)
         
-        # 5. Create new device
+        # 6. Create new device
         device = Device(
             user_id=user.id,
-            fingerprint=generate_device_fingerprint(),
-            device_model="TestDevice-Browser",
+            fingerprint=device_fingerprint or hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
+            device_model=device_model or "Unknown Device",
             last_login_at=datetime.utcnow(),
             is_active=True
         )
         db.add(device)
         db.flush()
         
-        # 6. Create refresh token
+        # 7. Create refresh token
         refresh_token_string = create_refresh_token_for_device(user.id, device.id, db)
         
-        # 7. Create access token
+        # 8. Create access token
         access_token = create_access_token(
             data={
                 "user_id": user.id,
@@ -119,12 +167,25 @@ async def login(
         
         db.commit()
         
-        return AuthResponse(
-            access_token=access_token,
-            refresh_token=refresh_token_string,
-            user_id=user.id,
-            role=user.role.value
+        # Set refresh token as HttpOnly cookie
+        response.set_cookie(
+            key="refresh_token",
+            value=refresh_token_string,
+            httponly=True,
+            secure=True,  # Set to True in production with HTTPS
+            samesite="lax",
+            max_age=30 * 24 * 60 * 60,  # 30 days
+            path="/"
         )
+        
+        # Return only access token in response body
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user_id": user.id,
+            "role": user.role.value,
+            "device_model": device.device_model
+        }
         
     except Exception as e:
         db.rollback()
@@ -134,21 +195,30 @@ async def login(
         )
 
 
-@router.post("/refresh", response_model=AuthResponse)
+@router.post("/refresh")
 async def refresh_access_token(
-    request: RefreshTokenRequest,
+    request: Request,
+    response: Response,
     db: Session = Depends(get_db)
 ):
     """
-    Refresh access token using refresh token
-    - Validates refresh token
+    Refresh access token using refresh token from HttpOnly cookie
+    - Validates refresh token from cookie
     - Checks if token is revoked or expired
-    - Issues new access token (and optionally new refresh token)
+    - Issues new access token
     """
-    # Hash the provided token to compare with stored hash
-    hashed_token = hashlib.sha256(request.refresh_token.encode()).hexdigest()
+    # Get refresh token from cookie
+    refresh_token_string = request.cookies.get("refresh_token")
     
-    # Find the refresh token in database
+    if not refresh_token_string:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token not found"
+        )
+    
+    # Hash the token to compare with stored hash
+    hashed_token = hashlib.sha256(refresh_token_string.encode()).hexdigest()
+    
     refresh_token = db.query(RefreshToken).filter(
         RefreshToken.token == hashed_token
     ).first()
@@ -159,21 +229,18 @@ async def refresh_access_token(
             detail="Invalid refresh token"
         )
     
-    # Check if token is revoked
     if refresh_token.revoked:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has been revoked. Please login again."
         )
     
-    # Check if token is expired
     if refresh_token.expires_at < datetime.utcnow():
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has expired. Please login again."
         )
     
-    # Check if device is still active
     device = db.query(Device).filter(Device.id == refresh_token.device_id).first()
     if not device or not device.is_active:
         raise HTTPException(
@@ -181,7 +248,6 @@ async def refresh_access_token(
             detail="Device is no longer active. Please login again."
         )
     
-    # Get user
     user = db.query(User).filter(User.id == refresh_token.user_id).first()
     if not user or not user.is_active:
         raise HTTPException(
@@ -204,26 +270,27 @@ async def refresh_access_token(
     device.last_login_at = datetime.utcnow()
     db.commit()
     
-    # Return the same refresh token (or generate a new one for rotation)
-    return AuthResponse(
-        access_token=access_token,
-        refresh_token=request.refresh_token,  # Keep same refresh token
-        user_id=user.id,
-        role=user.role.value
-    )
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user.id,
+        "role": user.role.value,
+        "device_model": device.device_model
+    }
 
 
-@router.post("/logout",dependencies=[Depends(bearer_scheme)], response_model=MessageResponse)
+@router.post("/logout", dependencies=[Depends(bearer_scheme)],response_model=MessageResponse)
 @auth_required
 async def logout(
     request: Request,
+    response: Response,
     db: Session = Depends(get_db)
 ):
     """
     Logout endpoint
     - Revokes current device's refresh tokens
     - Deactivates current device
-    - User must login again to access
+    - Clears refresh token cookie
     """
     user_data = request.state.user
     device_id = user_data.get("device_id")
@@ -247,6 +314,9 @@ async def logout(
         
         db.commit()
         
+        # Clear the refresh token cookie
+        response.delete_cookie(key="refresh_token", path="/")
+        
         return MessageResponse(message="Logged out successfully")
         
     except Exception as e:
@@ -261,19 +331,23 @@ async def logout(
 @auth_required
 async def logout_all_devices(
     request: Request,
+    response: Response,
     db: Session = Depends(get_db)
 ):
     """
     Logout from all devices
     - Revokes all refresh tokens for the user
     - Deactivates all devices for the user
-    - User must login again on all devices
+    - Clears refresh token cookie
     """
     user_data = request.state.user
     user_id = user_data.get("user_id")
     
     try:
         revoke_all_user_sessions(user_id, db)
+        
+        # Clear the refresh token cookie
+        response.delete_cookie(key="refresh_token", path="/")
         
         return MessageResponse(message="Logged out from all devices successfully")
         
@@ -285,7 +359,7 @@ async def logout_all_devices(
         )
 
 
-@router.get("/me", dependencies=[Depends(bearer_scheme)])
+@router.get("/me",dependencies=[Depends(bearer_scheme)])
 @auth_required
 async def get_current_user(
     request: Request,

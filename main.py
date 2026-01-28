@@ -2,10 +2,22 @@ from fastapi import FastAPI, APIRouter
 import fastapi_swagger_dark as fsd
 from sqlalchemy import text
 from core.database import engine
-
+from core.config import settings
 from routes import signup, login
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(docs_url=None)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        settings.FRONTEND_URL
+    ],
+    allow_credentials=True,  # ⚠️ REQUIRED for cookies!
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 router = APIRouter()
 fsd.install(router)

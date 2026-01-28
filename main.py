@@ -3,11 +3,17 @@ import fastapi_swagger_dark as fsd
 from sqlalchemy import text
 from core.database import engine
 
+from routes import signup, login
+
 app = FastAPI(docs_url=None)
 
 router = APIRouter()
 fsd.install(router)
 app.include_router(router)
+
+# Include routers
+app.include_router(signup.router)
+app.include_router(login.router)
 
 
 @app.get("/")

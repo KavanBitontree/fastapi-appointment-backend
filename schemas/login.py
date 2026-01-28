@@ -1,5 +1,6 @@
 from pydantic import BaseModel, EmailStr
 
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
@@ -15,6 +16,7 @@ class AuthResponse(BaseModel):
     token_type: str = "bearer"
     user_id: int
     role: str
+    device_model: str | None = None
 
 
 class MessageResponse(BaseModel):

@@ -9,6 +9,7 @@ ph = PasswordHasher()
 def hash_password(password: str) -> str:
     """
     Hash a plain password with Argon2.
+    Note: Argon2 doesn't have the 72-byte limit like bcrypt.
     """
     return ph.hash(password)
 

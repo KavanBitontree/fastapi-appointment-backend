@@ -155,18 +155,16 @@ async def signup_doctor(
 ):
     """
     Doctor signup endpoint
-    - Creates User, Doctor, Device, and RefreshToken entries
-    - Returns access token in JSON, refresh token in HttpOnly cookie
-    - Enforces single-session per user
+    - Creates User, Doctor (with location), Device, RefreshToken
     """
-    # Check if user already exists
+
     existing_user = db.query(User).filter(User.email == request.email).first()
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered"
         )
-    
+
     try:
         # 1. Create User
         user = User(
@@ -177,17 +175,20 @@ async def signup_doctor(
         )
         db.add(user)
         db.flush()
-        
-        # 2. Create Doctor profile
+
+        # 2. Create Doctor profile WITH LOCATION
         doctor = Doctor(
             user_id=user.id,
             name=request.name,
             speciality=request.speciality,
             opd_fees=request.opd_fees,
-            minimum_slot_duration=request.minimum_slot_duration
+            minimum_slot_duration=request.minimum_slot_duration,
+            address=request.address,
+            latitude=request.latitude,
+            longitude=request.longitude
         )
         db.add(doctor)
-        
+
         # 3. Create Device
         device = Device(
             user_id=user.id,
@@ -198,10 +199,10 @@ async def signup_doctor(
         )
         db.add(device)
         db.flush()
-        
+
         # 4. Create refresh token
         refresh_token_string = create_refresh_token(user.id, device.id, db)
-        
+
         # 5. Create access token
         access_token = create_access_token(
             data={
@@ -212,29 +213,26 @@ async def signup_doctor(
             },
             expires_minutes=15
         )
-        
+
         db.commit()
-        
-        # Set refresh token as HttpOnly cookie
+
         response.set_cookie(
             key="refresh_token",
             value=refresh_token_string,
             httponly=True,
-            secure=True,  # Set to True in production with HTTPS
+            secure=True,
             samesite="lax",
-            max_age=30 * 24 * 60 * 60,  # 30 days in seconds
+            max_age=30 * 24 * 60 * 60,
             path="/"
         )
-        
-        # Return only access token in response body
+
         return {
             "access_token": access_token,
             "token_type": "bearer",
             "user_id": user.id,
-            "role": user.role.value,
-            "device_model": device.device_model
+            "role": user.role.value
         }
-        
+
     except Exception as e:
         db.rollback()
         raise HTTPException(

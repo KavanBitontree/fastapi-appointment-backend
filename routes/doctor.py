@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, func
 from typing import List, Optional
 
 from deps import get_db
@@ -9,14 +9,21 @@ from models.user import User
 from middlewares.auth import auth_required, roles_required
 from core.enums import UserRole
 from schemas.doctor import DoctorRead
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/doctors", tags=["Doctors"])
 
 
-@router.get("/", response_model=List[DoctorRead])
-@auth_required
-@roles_required(UserRole.PATIENT)
+class DoctorsListResponse(BaseModel):
+    doctors: List[DoctorRead]
+    total: int
+    skip: int
+    limit: int
+
+
+@router.get("/", response_model=DoctorsListResponse)
 def get_all_doctors(
+    current_user: dict = Depends(auth_required()),
     db: Session = Depends(get_db),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(10, ge=1, le=100, description="Maximum number of records to return"),
@@ -30,6 +37,16 @@ def get_all_doctors(
     Get all doctors with filtering, searching, and sorting capabilities
     Only accessible by patients
     """
+    # Check if user has required role
+    user_role = current_user.get("role")
+    allowed_roles = [UserRole.PATIENT.value]
+
+    if user_role not in allowed_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized for this resource"
+        )
+
     query = db.query(Doctor).join(User)
 
     # Apply filters
@@ -41,7 +58,10 @@ def get_all_doctors(
         query = query.filter(Doctor.name.ilike(f"%{search_name}%"))
 
     if search_address:
-        query = query.filter(Doctor.address.ilike(f"%{search_address}%"))
+        query = query.filter(Doctor.clinic_address.ilike(f"%{search_address}%"))
+
+    # Get total count before pagination
+    total = query.count()
 
     # Apply sorting
     if sort_by == "name":
@@ -62,24 +82,37 @@ def get_all_doctors(
 
     # Apply pagination
     doctors = query.offset(skip).limit(limit).all()
-    
-    return doctors
+
+    return DoctorsListResponse(
+        doctors=doctors,
+        total=total,
+        skip=skip,
+        limit=limit
+    )
 
 
 @router.get("/{doctor_id}", response_model=DoctorRead)
-@auth_required
-@roles_required(UserRole.PATIENT)
 def get_doctor_by_id(
     doctor_id: int,
+    current_user: dict = Depends(auth_required()),
     db: Session = Depends(get_db)
 ):
     """
     Get a single doctor by ID
     Only accessible by patients
     """
+    # Check if user has required role
+    user_role = current_user.get("role")
+    allowed_roles = [UserRole.PATIENT.value]
+
+    if user_role not in allowed_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized for this resource"
+        )
+
     doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
     if not doctor:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Doctor not found")
-    
+
     return doctor

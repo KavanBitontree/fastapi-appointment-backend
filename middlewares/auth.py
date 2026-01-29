@@ -1,5 +1,4 @@
-from functools import wraps
-from fastapi import Request, HTTPException, status
+from fastapi import Request, HTTPException, status, Depends
 from jose import jwt, JWTError
 from sqlalchemy.orm import Session
 
@@ -10,108 +9,102 @@ from models.device import Device
 from models.user import User
 
 
-def auth_required(func):
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        request: Request = kwargs.get("request")
+async def get_current_user(request: Request, db: Session = Depends(get_db)):
+    """
+    Dependency to get the current authenticated user
+    """
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header missing",
+        )
 
-        if not request:
-            raise RuntimeError("Request object not found in route")
+    token = auth_header.split(" ")[1]
 
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authorization header missing",
-            )
+    try:
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+        )
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
 
-        token = auth_header.split(" ")[1]
+    user_id = payload.get("user_id")
+    device_id = payload.get("device_id")
+    role = payload.get("role")
 
-        try:
-            payload = jwt.decode(
-                token,
-                settings.JWT_SECRET_KEY,
-                algorithms=[settings.JWT_ALGORITHM],
-            )
-        except JWTError:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired token",
-            )
+    if not user_id or not device_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+        )
 
-        user_id = payload.get("user_id")
-        device_id = payload.get("device_id")
-        role = payload.get("role")
+    # 🔐 DB VALIDATION
+    # 1. Check user still exists & active
+    user = db.query(User).filter(
+        User.id == user_id,
+        User.is_active == True
+    ).first()
 
-        if not user_id or not device_id:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token payload",
-            )
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is inactive or deleted",
+        )
 
-        # 🔐 DB VALIDATION (THIS IS THE FIX)
-        db: Session = next(get_db())
+    # 2. Check device session is still active
+    device = db.query(Device).filter(
+        Device.id == device_id,
+        Device.user_id == user_id,
+        Device.is_active == True
+    ).first()
 
-        # 1. Check user still exists & active
-        user = db.query(User).filter(
-            User.id == user_id,
-            User.is_active == True
-        ).first()
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired due to login from another device",
+        )
 
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User account is inactive or deleted",
-            )
+    # Return user info
+    return {
+        "user_id": user_id,
+        "role": role,
+        "device_id": device_id,
+    }
 
-        # 2. Check device session is still active
-        device = db.query(Device).filter(
-            Device.id == device_id,
-            Device.user_id == user_id,
-            Device.is_active == True
-        ).first()
 
-        if not device:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session expired due to login from another device",
-            )
-
-        # Attach verified user info to request state
-        request.state.user = {
-            "user_id": user_id,
-            "role": role,
-            "device_id": device_id,
-        }
-
-        return await func(*args, **kwargs)
-
-    return wrapper
+def auth_required():
+    """
+    Decorator to require authentication
+    """
+    def auth_dependency(current_user=Depends(get_current_user)):
+        return current_user
+    return auth_dependency
 
 
 def roles_required(*roles: UserRole):
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            request: Request = kwargs.get("request")
+    """
+    Decorator to require specific roles
+    """
+    async def role_checker(request: Request, current_user: dict = Depends(get_current_user)):
+        user_role = current_user.get("role")
+        allowed_roles = [role.value for role in roles]
 
-            if not request or not hasattr(request.state, "user"):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authentication required",
-                )
+        if user_role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized for this resource",
+            )
 
-            user_role = request.state.user.get("role")
-            allowed_roles = [role.value for role in roles]
+        # Attach user info to request state for later use
+        request.state.user = current_user
+        return current_user
 
-            if user_role not in allowed_roles:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Not authorized for this resource",
-                )
-
-            return await func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
+    def role_dependency():
+        return Depends(role_checker)
+    return role_dependency()

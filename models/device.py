@@ -13,5 +13,6 @@ class Device(Base):
     last_login_at = Column(DateTime(timezone=True), server_default=func.now())
     is_active = Column(Boolean, default=True)
 
-    # Relationship
+    # Relationships
     user = relationship("User", back_populates="devices")
+    refresh_tokens = relationship("RefreshToken", back_populates="device")

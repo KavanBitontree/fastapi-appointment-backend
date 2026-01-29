@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, status, Depends, Request, Response
 from sqlalchemy.orm import Session
 import secrets
@@ -21,7 +21,8 @@ def create_refresh_token_for_device(user_id: int, device_id: int, db: Session) -
     """Create and store a refresh token"""
     token_string = secrets.token_urlsafe(32)
     hashed_token = hashlib.sha256(token_string.encode()).hexdigest()
-    expires_at = datetime.utcnow() + timedelta(days=30)
+    # Store timezone-aware UTC timestamp (column is timezone=True)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
     
     refresh_token = RefreshToken(
         user_id=user_id,
@@ -145,7 +146,7 @@ async def login(
             user_id=user.id,
             fingerprint=device_fingerprint or hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
             device_model=device_model or "Unknown Device",
-            last_login_at=datetime.utcnow(),
+            last_login_at=datetime.now(timezone.utc),
             is_active=True
         )
         db.add(device)
@@ -235,7 +236,14 @@ async def refresh_access_token(
             detail="Refresh token has been revoked. Please login again."
         )
     
-    if refresh_token.expires_at < datetime.utcnow():
+    # Compare using timezone-aware UTC datetimes to avoid naive/aware TypeError
+    now_utc = datetime.now(timezone.utc)
+    expires_at = refresh_token.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        # If stored value is naive (legacy rows), assume it's UTC
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    if expires_at and expires_at < now_utc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has expired. Please login again."
@@ -267,7 +275,7 @@ async def refresh_access_token(
     )
     
     # Update device last login
-    device.last_login_at = datetime.utcnow()
+    device.last_login_at = datetime.now(timezone.utc)
     db.commit()
     
     return {

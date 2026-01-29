@@ -82,11 +82,11 @@ async def signup_patient(
         db.add(user)
         db.flush()
         
-        # 2. Create Patient profile
+        # 2. Create Patient profile with DOB
         patient = Patient(
             user_id=user.id,
             name=request.name,
-            age=request.age
+            dob=request.dob  # Store date of birth
         )
         db.add(patient)
         

@@ -1,4 +1,5 @@
 from pydantic import BaseModel, EmailStr, field_validator
+from datetime import date
 import re
 
 
@@ -35,7 +36,27 @@ class PatientSignupRequest(BaseModel, PasswordValidationMixin):
     password: str
     confirm_password: str
     name: str
-    age: int
+    dob: date  # Date of Birth field
+    
+    @field_validator('dob')
+    @classmethod
+    def validate_dob(cls, v: date) -> date:
+        """Validate date of birth is not in the future and person is not too old"""
+        today = date.today()
+        
+        if v > today:
+            raise ValueError('Date of birth cannot be in the future')
+        
+        # Calculate age
+        age = today.year - v.year - ((today.month, today.day) < (v.month, v.day))
+        
+        if age < 0:
+            raise ValueError('Invalid date of birth')
+        
+        if age > 150:
+            raise ValueError('Date of birth indicates age over 150 years')
+        
+        return v
     
     @field_validator('confirm_password')
     @classmethod

@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Security
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, func
 from typing import List, Optional
-
+from core.security_schemes import bearer_scheme
 from deps import get_db
 from models.doctor import Doctor
 from models.user import User
@@ -21,7 +21,7 @@ class DoctorsListResponse(BaseModel):
     limit: int
 
 
-@router.get("/", response_model=DoctorsListResponse)
+@router.get("/", dependencies=[Security(bearer_scheme)],response_model=DoctorsListResponse)
 def get_all_doctors(
     current_user: dict = Depends(auth_required()),
     db: Session = Depends(get_db),
@@ -91,7 +91,7 @@ def get_all_doctors(
     )
 
 
-@router.get("/{doctor_id}", response_model=DoctorRead)
+@router.get("/{doctor_id}", dependencies=[Security(bearer_scheme)],response_model=DoctorRead)
 def get_doctor_by_id(
     doctor_id: int,
     current_user: dict = Depends(auth_required()),

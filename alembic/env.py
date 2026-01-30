@@ -7,7 +7,11 @@ from alembic import context
 
 from core.database import Base
 from core.config import settings
-from models import User, Doctor, Patient, Device, RefreshToken
+from models.user import User
+from models.doctor import Doctor
+from models.patient import Patient
+from models.device import Device
+from models.refresh_token import RefreshToken
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -63,7 +67,7 @@ def run_migrations_online() -> None:
         "sqlalchemy.url": settings.NEON_DB_URL,
         "sqlalchemy.connect_args": {"sslmode": "require"}
     }
-    
+
     connectable = engine_from_config(
         configuration,
         prefix="sqlalchemy.",

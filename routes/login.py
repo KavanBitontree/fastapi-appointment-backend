@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, HTTPException, status, Depends, Request, Response
+from fastapi import APIRouter, HTTPException, status, Depends, Request, Response,Security
 from sqlalchemy.orm import Session
 import secrets
 import hashlib
@@ -287,7 +287,7 @@ async def refresh_access_token(
     }
 
 
-@router.post("/logout", response_model=MessageResponse)
+@router.post("/logout", dependencies=[Security(bearer_scheme)],response_model=MessageResponse)
 async def logout(
     request: Request,
     response: Response,
@@ -334,7 +334,7 @@ async def logout(
         )
 
 
-@router.post("/logout-all", response_model=MessageResponse)
+@router.post("/logout-all", dependencies=[Security(bearer_scheme)],response_model=MessageResponse)
 async def logout_all_devices(
     request: Request,
     response: Response,
@@ -365,7 +365,7 @@ async def logout_all_devices(
         )
 
 
-@router.get("/me")
+@router.get("/me",dependencies=[Security(bearer_scheme)])
 async def get_current_user(
     request: Request,
     current_user: dict = Depends(auth_required()),

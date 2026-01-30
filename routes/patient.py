@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException,Security
 from sqlalchemy.orm import Session
 from typing import Optional
-
+from core.security_schemes import bearer_scheme
 from deps import get_db
 from models.patient import Patient
 from models.user import User
@@ -12,7 +12,7 @@ from schemas.patient import PatientRead
 router = APIRouter(prefix="/patients", tags=["Patients"])
 
 
-@router.get("/{patient_id}", response_model=PatientRead)
+@router.get("/{patient_id}", dependencies=[Security(bearer_scheme)],response_model=PatientRead)
 def get_patient_by_id(
     patient_id: int,
     current_user: dict = Depends(auth_required()),

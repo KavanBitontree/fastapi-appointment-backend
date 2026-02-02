@@ -8,10 +8,6 @@
     {
       "path": "/api/cron/daily-maintenance",
       "schedule": "0 0 * * *"
-    },
-    {
-      "path": "/api/cron/release-expired-holds",
-      "schedule": "*/5 * * * *"
     }
   ]
 }

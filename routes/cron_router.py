@@ -159,72 +159,6 @@ async def daily_slot_maintenance(
         )
 
 
-@cron_router.get("/release-expired-holds")
-async def release_expired_holds(
-    db: Session = Depends(get_db),
-    authorized: bool = Depends(verify_cron_secret)
-) -> Dict[str, Any]:
-    """
-    Release slots that have been held for more than 10 minutes.
-
-    This job should run every 1-5 minutes to prevent slots from being
-    permanently locked due to abandoned bookings.
-
-    Scheduled: Every 1 minute via Vercel Cron
-    Security: Requires CRON_SECRET in Authorization header
-    """
-    try:
-        now = datetime.now()
-
-        # Find all expired holds
-        expired_slots = db.query(DoctorSlot).filter(
-            DoctorSlot.status == SlotStatus.HELD,
-            DoctorSlot.held_expires_at < now
-        ).all()
-
-        if not expired_slots:
-            return {
-                "success": True,
-                "timestamp": now.isoformat(),
-                "released_count": 0,
-                "message": "No expired holds found"
-            }
-
-        # Release each expired slot
-        released_details = []
-        for slot in expired_slots:
-            released_details.append({
-                "slot_id": slot.id,
-                "doctor_id": slot.doctor_id,
-                "date": str(slot.date),
-                "time": f"{slot.start_time}-{slot.end_time}",
-                "held_by_patient_id": slot.held_by_patient_id,
-                "expired_at": slot.held_expires_at.isoformat() if slot.held_expires_at else None
-            })
-
-            slot.status = SlotStatus.FREE
-            slot.held_at = None
-            slot.held_by_patient_id = None
-            slot.held_expires_at = None
-
-        db.commit()
-
-        return {
-            "success": True,
-            "timestamp": now.isoformat(),
-            "released_count": len(expired_slots),
-            "message": f"Released {len(expired_slots)} expired holds",
-            "details": released_details
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to release expired holds: {str(e)}"
-        )
-
-
 @cron_router.get("/health")
 async def cron_health_check(
     authorized: bool = Depends(verify_cron_secret)
@@ -252,20 +186,6 @@ async def manual_maintenance_trigger(
     Security: Requires CRON_SECRET in Authorization header
     """
     return await daily_slot_maintenance(db=db, authorized=authorized)
-
-
-@cron_router.post("/manual-release-holds")
-async def manual_release_holds_trigger(
-    db: Session = Depends(get_db),
-    authorized: bool = Depends(verify_cron_secret)
-) -> Dict[str, Any]:
-    """
-    Manually trigger the release expired holds job.
-    Useful for testing or emergency runs.
-
-    Security: Requires CRON_SECRET in Authorization header
-    """
-    return await release_expired_holds(db=db, authorized=authorized)
 
 
 @cron_router.get("/statistics")

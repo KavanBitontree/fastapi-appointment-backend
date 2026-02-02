@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from fastapi import APIRouter, HTTPException, status, Depends, Response
 from sqlalchemy.orm import Session
 import secrets
@@ -22,8 +22,8 @@ def create_refresh_token(user_id: int, device_id: int, db: Session) -> str:
     """Create and store a refresh token"""
     token_string = secrets.token_urlsafe(32)
     hashed_token = hashlib.sha256(token_string.encode()).hexdigest()
-    expires_at = datetime.utcnow() + timedelta(days=30)
-    
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+
     refresh_token = RefreshToken(
         user_id=user_id,
         device_id=device_id,
@@ -33,7 +33,7 @@ def create_refresh_token(user_id: int, device_id: int, db: Session) -> str:
     )
     db.add(refresh_token)
     db.commit()
-    
+
     return token_string
 
 
@@ -42,11 +42,11 @@ def revoke_all_user_sessions(user_id: int, db: Session):
     db.query(RefreshToken).filter(
         RefreshToken.user_id == user_id
     ).update({"revoked": True})
-    
+
     db.query(Device).filter(
         Device.user_id == user_id
     ).update({"is_active": False})
-    
+
     db.commit()
 
 
@@ -71,7 +71,7 @@ async def signup_patient(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered"
         )
-    
+
     try:
         # 1. Create User
         user = User(
@@ -82,7 +82,7 @@ async def signup_patient(
         )
         db.add(user)
         db.flush()
-        
+
         # 2. Create Patient profile with DOB
         patient = Patient(
             user_id=user.id,
@@ -90,21 +90,21 @@ async def signup_patient(
             dob=request.dob
         )
         db.add(patient)
-        
+
         # 3. Create Device
         device = Device(
             user_id=user.id,
             fingerprint=device_fingerprint or hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
             device_model=device_model or "Unknown Device",
-            last_login_at=datetime.utcnow(),
+            last_login_at=datetime.now(timezone.utc),
             is_active=True
         )
         db.add(device)
         db.flush()
-        
+
         # 4. Create refresh token
         refresh_token_string = create_refresh_token(user.id, device.id, db)
-        
+
         # 5. Create access token
         access_token = create_access_token(
             data={
@@ -115,9 +115,9 @@ async def signup_patient(
             },
             expires_minutes=15
         )
-        
+
         db.commit()
-        
+
         # Set refresh token as HttpOnly cookie
         response.set_cookie(
             key="refresh_token",
@@ -128,7 +128,7 @@ async def signup_patient(
             max_age=30 * 24 * 60 * 60,
             path="/"
         )
-        
+
         return {
             "access_token": access_token,
             "token_type": "bearer",
@@ -136,7 +136,7 @@ async def signup_patient(
             "role": user.role.value,
             "device_model": device.device_model
         }
-        
+
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -195,7 +195,7 @@ async def signup_doctor(
         # Use clinic hours from request or default 9 AM - 5 PM
         clinic_start = getattr(request, 'clinic_start_time', time(9, 0))
         clinic_end = getattr(request, 'clinic_end_time', time(17, 0))
-        
+
         setup_default_doctor_availability(
             db=db,
             doctor=doctor,
@@ -208,7 +208,7 @@ async def signup_doctor(
             user_id=user.id,
             fingerprint=device_fingerprint or hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
             device_model=device_model or "Unknown Device",
-            last_login_at=datetime.utcnow(),
+            last_login_at=datetime.now(timezone.utc),
             is_active=True
         )
         db.add(device)

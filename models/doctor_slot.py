@@ -16,6 +16,11 @@ class DoctorSlot(Base):
     end_time = Column(Time, nullable=False)
     status = Column(Enum(SlotStatus, name="slot_status"), nullable=False, default=SlotStatus.FREE)
     
+    # NEW: HELD status support columns
+    held_at = Column(DateTime(timezone=True), nullable=True)
+    held_by_patient_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    held_expires_at = Column(DateTime(timezone=True), nullable=True)
+    
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -23,11 +28,16 @@ class DoctorSlot(Base):
     doctor = relationship("Doctor", back_populates="slots")
     availability = relationship("DoctorAvailability", back_populates="slots")
     appointment = relationship("Appointment", back_populates="slot", uselist=False)  # One slot = One appointment
+    held_by_patient = relationship("User", foreign_keys=[held_by_patient_id])
 
-    # Composite index for efficient slot queries
+    # Composite indexes for efficient slot queries
     __table_args__ = (
         Index('idx_doctor_date_status', 'doctor_id', 'date', 'status'),
         Index('idx_doctor_date_time', 'doctor_id', 'date', 'start_time'),
+        # NEW: Index for expired holds cleanup (partial index in PostgreSQL)
+        Index('idx_held_expires', 'held_expires_at', postgresql_where=(status == SlotStatus.HELD)),
+        # NEW: Index for patient holds
+        Index('idx_held_by_patient', 'held_by_patient_id', 'status'),
     )
 
     def __repr__(self):

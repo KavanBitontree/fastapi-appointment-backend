@@ -28,10 +28,12 @@ def create_availability(
     db.flush()  # get availability.id
 
     if availability.is_available:
+        # Always skip past times - no reason to create slots that can't be booked
         generate_slots_for_availability(
             db=db,
             doctor=doctor,
             availability=availability,
+            skip_past=True  # Changed to True - always skip past times
         )
 
     return availability

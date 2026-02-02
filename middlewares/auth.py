@@ -11,7 +11,8 @@ from models.user import User
 
 async def get_current_user(request: Request, db: Session = Depends(get_db)):
     """
-    Dependency to get the current authenticated user
+    Dependency to get the current authenticated user.
+    Validates JWT token and checks user/device status in database.
     """
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -80,18 +81,32 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)):
 
 def auth_required():
     """
-    Decorator to require authentication
+    Dependency to require authentication (any logged-in user).
+    
+    Usage:
+        @router.get("/protected")
+        def protected_route(current_user: dict = Depends(auth_required())):
+            return {"user": current_user}
+    
+    Note: For role-based auth, use roles_required() instead.
     """
-    def auth_dependency(current_user=Depends(get_current_user)):
-        return current_user
-    return auth_dependency
+    return get_current_user
 
 
 def roles_required(*roles: UserRole):
     """
-    Decorator to require specific roles
+    Dependency factory to require specific roles.
+    
+    Usage:
+        @router.get("/doctor-only")
+        def doctor_endpoint(current_user: dict = Depends(roles_required(UserRole.DOCTOR))):
+            return {"user": current_user}
+        
+        @router.get("/admin-or-doctor")
+        def multi_role(current_user: dict = Depends(roles_required(UserRole.ADMIN, UserRole.DOCTOR))):
+            return {"user": current_user}
     """
-    async def role_checker(request: Request, current_user: dict = Depends(get_current_user)):
+    async def role_checker(current_user: dict = Depends(get_current_user)) -> dict:
         user_role = current_user.get("role")
         allowed_roles = [role.value for role in roles]
 
@@ -101,10 +116,6 @@ def roles_required(*roles: UserRole):
                 detail="Not authorized for this resource",
             )
 
-        # Attach user info to request state for later use
-        request.state.user = current_user
         return current_user
-
-    def role_dependency():
-        return Depends(role_checker)
-    return role_dependency()
+    
+    return role_checker

@@ -39,7 +39,7 @@ def get_patient_by_id(
     return patient
 
 
-@router.get("/", response_model=PatientRead)
+@router.get("/", dependencies=[Security(bearer_scheme)],response_model=PatientRead)
 def get_current_patient(
     current_user: dict = Depends(auth_required()),
     db: Session = Depends(get_db)

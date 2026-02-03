@@ -58,7 +58,7 @@ def get_all_doctors(
         query = query.filter(Doctor.name.ilike(f"%{search_name}%"))
 
     if search_address:
-        query = query.filter(Doctor.clinic_address.ilike(f"%{search_address}%"))
+        query = query.filter(Doctor.address.ilike(f"%{search_address}%"))
 
     # Get total count before pagination
     total = query.count()

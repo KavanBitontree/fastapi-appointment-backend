@@ -3,3 +3,7 @@ from .doctor import Doctor
 from .patient import Patient
 from .device import Device
 from .refresh_token import RefreshToken
+from .appointment import Appointment
+from .doctor_slot import DoctorSlot
+from .payment import Payment
+from .doctor_availability import DoctorAvailability

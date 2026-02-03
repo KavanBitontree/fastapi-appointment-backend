@@ -12,6 +12,10 @@ from models.doctor import Doctor
 from models.patient import Patient
 from models.device import Device
 from models.refresh_token import RefreshToken
+from models.appointment import Appointment
+from models.doctor_slot import DoctorSlot
+from models.payment import Payment
+from models.doctor_availability import DoctorAvailability
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

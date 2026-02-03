@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, HTTPException, status, Depends, Request, Response,Security
+from fastapi import APIRouter, HTTPException, status, Depends, Request, Response, Security
 from sqlalchemy.orm import Session
 import secrets
 import hashlib
@@ -96,6 +96,7 @@ async def login(
     - Revokes all existing sessions for the user (if force_login=True)
     - Creates new device and session
     - Returns access token in JSON, refresh token in HttpOnly cookie
+    - Sets access token as HttpOnly cookie for server-side Next.js
     """
     # 1. Find user
     user = db.query(User).filter(User.email == request.email).first()
@@ -179,7 +180,18 @@ async def login(
             path="/"
         )
 
-        # Return only access token in response body
+        # Set access token as HttpOnly cookie (for server-side Next.js)
+        response.set_cookie(
+            key="access_token",
+            value=access_token,
+            httponly=True,
+            secure=True,  # Set to True in production with HTTPS
+            samesite="lax",
+            max_age=15 * 60,  # 15 minutes
+            path="/"
+        )
+
+        # Return access token in response body (for client-side localStorage)
         return {
             "access_token": access_token,
             "token_type": "bearer",
@@ -207,6 +219,7 @@ async def refresh_access_token(
     - Validates refresh token from cookie
     - Checks if token is revoked or expired
     - Issues new access token
+    - Sets new access token as HttpOnly cookie for server-side Next.js
     """
     # Get refresh token from cookie
     refresh_token_string = request.cookies.get("refresh_token")
@@ -278,6 +291,17 @@ async def refresh_access_token(
     device.last_login_at = datetime.now(timezone.utc)
     db.commit()
 
+    # Set access token as HttpOnly cookie (for server-side Next.js)
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=True,  # Set to True in production with HTTPS
+        samesite="lax",
+        max_age=15 * 60,  # 15 minutes
+        path="/"
+    )
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -287,7 +311,7 @@ async def refresh_access_token(
     }
 
 
-@router.post("/logout", dependencies=[Security(bearer_scheme)],response_model=MessageResponse)
+@router.post("/logout", dependencies=[Security(bearer_scheme)], response_model=MessageResponse)
 async def logout(
     request: Request,
     response: Response,
@@ -298,7 +322,7 @@ async def logout(
     Logout endpoint
     - Revokes current device's refresh tokens
     - Deactivates current device
-    - Clears refresh token cookie
+    - Clears refresh token and access token cookies
     """
     device_id = current_user.get("device_id")
 
@@ -321,8 +345,9 @@ async def logout(
 
         db.commit()
 
-        # Clear the refresh token cookie
+        # Clear both cookies
         response.delete_cookie(key="refresh_token", path="/")
+        response.delete_cookie(key="access_token", path="/")
 
         return MessageResponse(message="Logged out successfully")
 
@@ -334,7 +359,7 @@ async def logout(
         )
 
 
-@router.post("/logout-all", dependencies=[Security(bearer_scheme)],response_model=MessageResponse)
+@router.post("/logout-all", dependencies=[Security(bearer_scheme)], response_model=MessageResponse)
 async def logout_all_devices(
     request: Request,
     response: Response,
@@ -345,15 +370,16 @@ async def logout_all_devices(
     Logout from all devices
     - Revokes all refresh tokens for the user
     - Deactivates all devices for the user
-    - Clears refresh token cookie
+    - Clears refresh token and access token cookies
     """
     user_id = current_user.get("user_id")
 
     try:
         revoke_all_user_sessions(user_id, db)
 
-        # Clear the refresh token cookie
+        # Clear both cookies
         response.delete_cookie(key="refresh_token", path="/")
+        response.delete_cookie(key="access_token", path="/")
 
         return MessageResponse(message="Logged out from all devices successfully")
 
@@ -365,7 +391,7 @@ async def logout_all_devices(
         )
 
 
-@router.get("/me",dependencies=[Security(bearer_scheme)])
+@router.get("/me", dependencies=[Security(bearer_scheme)])
 async def get_current_user(
     request: Request,
     current_user: dict = Depends(auth_required()),

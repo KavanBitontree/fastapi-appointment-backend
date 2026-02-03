@@ -3,5 +3,11 @@
     "env": {
       "PYTHONPATH": "."
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/daily-maintenance",
+      "schedule": "0 0 * * *"
+    }
+  ]
 }

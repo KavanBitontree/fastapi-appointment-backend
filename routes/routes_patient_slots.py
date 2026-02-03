@@ -2,12 +2,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Security
 from sqlalchemy.orm import Session
 from typing import Optional
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from core.security_schemes import bearer_scheme
 from deps import get_db
 from middlewares.auth import roles_required
 from core.enums import UserRole, SlotStatus
 from models.doctor_slot import DoctorSlot
 from models.doctor import Doctor
+
+# Define IST timezone
+IST = ZoneInfo("Asia/Kolkata")
 
 
 router = APIRouter(
@@ -42,7 +46,40 @@ def release_expired_holds_inline(db: Session) -> int:
 
 
 # ─────────────────────────────────────────────────────────────
-# VIEW SLOTS (AUTO-CLEAN EXPIRED HOLDS)
+# 🔥 DELETE PAST FREE SLOTS (Before current time in IST)
+# ─────────────────────────────────────────────────────────────
+def delete_past_free_slots_inline(db: Session) -> int:
+    """
+    Delete all FREE slots that are in the past (before current datetime in IST)
+    """
+    # Get current time in IST
+    now_ist = datetime.now(IST)
+    today_ist = now_ist.date()
+    current_time_ist = now_ist.time()
+
+    # Delete slots from past dates
+    deleted_past_dates = db.query(DoctorSlot).filter(
+        DoctorSlot.status == SlotStatus.FREE,
+        DoctorSlot.date < today_ist
+    ).delete(synchronize_session=False)
+
+    # Delete slots from today that have already passed (end_time has passed)
+    deleted_today = db.query(DoctorSlot).filter(
+        DoctorSlot.status == SlotStatus.FREE,
+        DoctorSlot.date == today_ist,
+        DoctorSlot.end_time <= current_time_ist
+    ).delete(synchronize_session=False)
+
+    total_deleted = deleted_past_dates + deleted_today
+
+    if total_deleted:
+        db.commit()
+
+    return total_deleted
+
+
+# ─────────────────────────────────────────────────────────────
+# VIEW SLOTS (AUTO-CLEAN EXPIRED HOLDS + PAST FREE SLOTS)
 # ─────────────────────────────────────────────────────────────
 @router.get("/view/slots")
 async def get_doctor_slots_for_booking(
@@ -55,6 +92,9 @@ async def get_doctor_slots_for_booking(
 ):
     # 🔥 Auto release expired holds
     release_expired_holds_inline(db)
+    
+    # 🔥 Auto delete past FREE slots
+    delete_past_free_slots_inline(db)
 
     doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
     if not doctor:
@@ -126,12 +166,22 @@ async def hold_slot(
     current_user: dict = Depends(roles_required(UserRole.PATIENT)),
     db: Session = Depends(get_db)
 ):
-    slot = db.query(DoctorSlot).filter(DoctorSlot.id == slot_id).first()
+    # 🔒 ROW LOCK
+    slot = (
+        db.query(DoctorSlot)
+        .filter(DoctorSlot.id == slot_id)
+        .with_for_update()
+        .first()
+    )
+
     if not slot:
         raise HTTPException(status_code=404, detail="Slot not found")
 
     if slot.status != SlotStatus.FREE:
-        if slot.status == SlotStatus.HELD and slot.held_by_patient_id == current_user["user_id"]:
+        if (
+            slot.status == SlotStatus.HELD and
+            slot.held_by_patient_id == current_user["user_id"]
+        ):
             now = datetime.now(timezone.utc)
             expiry = now + timedelta(minutes=10)
             slot.held_at = now
@@ -144,20 +194,24 @@ async def hold_slot(
                 "time_remaining_seconds": 600,
                 "message": "Hold refreshed"
             }
-        raise HTTPException(status_code=409, detail="Slot cannot be held")
 
-    existing_holds = db.query(DoctorSlot).filter(
+        raise HTTPException(status_code=409, detail="Slot already taken")
+
+    # Release other holds by this user on same date
+    db.query(DoctorSlot).filter(
         DoctorSlot.doctor_id == slot.doctor_id,
         DoctorSlot.date == slot.date,
         DoctorSlot.status == SlotStatus.HELD,
         DoctorSlot.held_by_patient_id == current_user["user_id"]
-    ).all()
-
-    for h in existing_holds:
-        h.status = SlotStatus.FREE
-        h.held_at = None
-        h.held_by_patient_id = None
-        h.held_expires_at = None
+    ).update(
+        {
+            DoctorSlot.status: SlotStatus.FREE,
+            DoctorSlot.held_at: None,
+            DoctorSlot.held_by_patient_id: None,
+            DoctorSlot.held_expires_at: None,
+        },
+        synchronize_session=False
+    )
 
     now = datetime.now(timezone.utc)
     expiry = now + timedelta(minutes=10)
@@ -177,6 +231,7 @@ async def hold_slot(
         "time_remaining_seconds": 600,
         "message": "Slot held successfully"
     }
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -222,8 +277,11 @@ async def get_slots_by_date(
     current_user: dict = Depends(roles_required(UserRole.PATIENT)),
     db: Session = Depends(get_db)
 ):
-    # 🔥 Auto cleanup
+    # 🔥 Auto cleanup expired holds
     release_expired_holds_inline(db)
+    
+    # 🔥 Auto delete past FREE slots
+    delete_past_free_slots_inline(db)
 
     doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
     if not doctor:

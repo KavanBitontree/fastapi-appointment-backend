@@ -10,9 +10,15 @@ from core.enums import UserRole, SlotStatus
 from models.doctor_slot import DoctorSlot
 from models.doctor import Doctor
 
+# Import the enhanced cleanup service
+from services.slot_cleanup_service import (
+    release_expired_holds,
+    delete_unbookable_free_slots,
+    get_booking_window_info
+)
+
 # Define IST timezone
 IST = ZoneInfo("Asia/Kolkata")
-
 
 router = APIRouter(
     prefix="/patient",
@@ -20,66 +26,27 @@ router = APIRouter(
     dependencies=[Security(bearer_scheme)]
 )
 
-# ─────────────────────────────────────────────────────────────
-# 🔥 INLINE EXPIRED HOLD CLEANUP (Hobby-safe replacement for cron)
-# ─────────────────────────────────────────────────────────────
-def release_expired_holds_inline(db: Session) -> int:
-    now = datetime.now(timezone.utc)
-
-    released = db.query(DoctorSlot).filter(
-        DoctorSlot.status == SlotStatus.HELD,
-        DoctorSlot.held_expires_at < now
-    ).update(
-        {
-            DoctorSlot.status: SlotStatus.FREE,
-            DoctorSlot.held_at: None,
-            DoctorSlot.held_by_patient_id: None,
-            DoctorSlot.held_expires_at: None,
-        },
-        synchronize_session=False
-    )
-
-    if released:
-        db.commit()
-
-    return released
-
 
 # ─────────────────────────────────────────────────────────────
-# 🔥 DELETE PAST FREE SLOTS (Before current time in IST)
+# 🔥 VIEW BOOKING WINDOW INFO (NEW ENDPOINT)
 # ─────────────────────────────────────────────────────────────
-def delete_past_free_slots_inline(db: Session) -> int:
+@router.get("/booking-window")
+async def get_booking_window(
+    current_user: dict = Depends(roles_required(UserRole.PATIENT))
+):
     """
-    Delete all FREE slots that are in the past (before current datetime in IST)
+    Get information about the current booking window.
+    
+    Returns:
+        - Current time
+        - Earliest bookable datetime (25 hours from now)
+        - Explanation of the 25-hour buffer rule
     """
-    # Get current time in IST
-    now_ist = datetime.now(IST)
-    today_ist = now_ist.date()
-    current_time_ist = now_ist.time()
-
-    # Delete slots from past dates
-    deleted_past_dates = db.query(DoctorSlot).filter(
-        DoctorSlot.status == SlotStatus.FREE,
-        DoctorSlot.date < today_ist
-    ).delete(synchronize_session=False)
-
-    # Delete slots from today that have already passed (end_time has passed)
-    deleted_today = db.query(DoctorSlot).filter(
-        DoctorSlot.status == SlotStatus.FREE,
-        DoctorSlot.date == today_ist,
-        DoctorSlot.end_time <= current_time_ist
-    ).delete(synchronize_session=False)
-
-    total_deleted = deleted_past_dates + deleted_today
-
-    if total_deleted:
-        db.commit()
-
-    return total_deleted
+    return get_booking_window_info()
 
 
 # ─────────────────────────────────────────────────────────────
-# VIEW SLOTS (AUTO-CLEAN EXPIRED HOLDS + PAST FREE SLOTS)
+# 🔥 VIEW SLOTS (WITH 25-HOUR BUFFER CLEANUP)
 # ─────────────────────────────────────────────────────────────
 @router.get("/view/slots")
 async def get_doctor_slots_for_booking(
@@ -90,11 +57,24 @@ async def get_doctor_slots_for_booking(
     current_user: dict = Depends(roles_required(UserRole.PATIENT)),
     db: Session = Depends(get_db)
 ):
-    # 🔥 Auto release expired holds
-    release_expired_holds_inline(db)
+    """
+    Get doctor's slots for booking.
     
-    # 🔥 Auto delete past FREE slots
-    delete_past_free_slots_inline(db)
+    CRITICAL CHANGES:
+    - Auto-releases expired holds (10 min)
+    - Auto-deletes unbookable FREE slots (within 25-hour buffer)
+    - Only shows slots that can actually be booked
+    
+    25-Hour Buffer Rule:
+    - Patients can only book slots ≥ 25 hours away from current time
+    - This ensures doctor has 24 hours to approve before appointment time
+    """
+    
+    # 🔥 AUTO-CLEANUP: Release expired holds
+    release_expired_holds(db)
+    
+    # 🔥 AUTO-CLEANUP: Delete unbookable FREE slots (< 25 hours away)
+    delete_unbookable_free_slots(db)
 
     doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
     if not doctor:
@@ -114,6 +94,7 @@ async def get_doctor_slots_for_booking(
     if status:
         query = query.filter(DoctorSlot.status == status.upper())
     else:
+        # Show FREE, BOOKED, BLOCKED, and HELD (if held by current user)
         query = query.filter(
             (DoctorSlot.status.in_(
                 [SlotStatus.FREE, SlotStatus.BOOKED, SlotStatus.BLOCKED]
@@ -149,11 +130,15 @@ async def get_doctor_slots_for_booking(
 
         slots_data.append(data)
 
+    # Add booking window info to response
+    booking_window = get_booking_window_info()
+
     return {
         "total": len(slots_data),
         "slots": slots_data,
         "doctor_id": doctor_id,
-        "doctor_name": doctor.name
+        "doctor_name": doctor.name,
+        "booking_window": booking_window
     }
 
 
@@ -166,6 +151,13 @@ async def hold_slot(
     current_user: dict = Depends(roles_required(UserRole.PATIENT)),
     db: Session = Depends(get_db)
 ):
+    """
+    Hold a slot for 10 minutes while patient fills appointment form.
+    
+    Note: Slot must be ≥ 25 hours away (enforced by cleanup).
+    If slot is within 25-hour buffer, it won't exist in DB.
+    """
+    
     # 🔒 ROW LOCK
     slot = (
         db.query(DoctorSlot)
@@ -182,6 +174,7 @@ async def hold_slot(
             slot.status == SlotStatus.HELD and
             slot.held_by_patient_id == current_user["user_id"]
         ):
+            # Refresh the hold
             now = datetime.now(timezone.utc)
             expiry = now + timedelta(minutes=10)
             slot.held_at = now
@@ -233,7 +226,6 @@ async def hold_slot(
     }
 
 
-
 # ─────────────────────────────────────────────────────────────
 # RELEASE SLOT (UNCHANGED)
 # ─────────────────────────────────────────────────────────────
@@ -243,6 +235,7 @@ async def release_slot(
     current_user: dict = Depends(roles_required(UserRole.PATIENT)),
     db: Session = Depends(get_db)
 ):
+    """Release a held slot"""
     slot = db.query(DoctorSlot).filter(DoctorSlot.id == slot_id).first()
     if not slot:
         raise HTTPException(status_code=404, detail="Slot not found")
@@ -268,7 +261,7 @@ async def release_slot(
 
 
 # ─────────────────────────────────────────────────────────────
-# GET SLOTS BY DATE (AUTO-CLEAN INCLUDED)
+# GET SLOTS BY DATE (WITH 25-HOUR BUFFER CLEANUP)
 # ─────────────────────────────────────────────────────────────
 @router.get("/slots/by-date")
 async def get_slots_by_date(
@@ -277,11 +270,15 @@ async def get_slots_by_date(
     current_user: dict = Depends(roles_required(UserRole.PATIENT)),
     db: Session = Depends(get_db)
 ):
-    # 🔥 Auto cleanup expired holds
-    release_expired_holds_inline(db)
+    """
+    Get slots for a specific date.
     
-    # 🔥 Auto delete past FREE slots
-    delete_past_free_slots_inline(db)
+    CRITICAL: Auto-cleanup runs first to remove unbookable slots.
+    """
+    
+    # 🔥 AUTO-CLEANUP
+    release_expired_holds(db)
+    delete_unbookable_free_slots(db)
 
     doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
     if not doctor:
@@ -322,10 +319,14 @@ async def get_slots_by_date(
 
         slots_data.append(data)
 
+    # Add info about why some dates might have no slots
+    booking_window = get_booking_window_info()
+
     return {
         "date": date,
         "slots": slots_data,
         "has_free_slots": has_free_slots,
         "doctor_id": doctor_id,
-        "doctor_name": doctor.name
+        "doctor_name": doctor.name,
+        "booking_window": booking_window
     }

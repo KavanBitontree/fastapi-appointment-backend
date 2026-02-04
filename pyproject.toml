@@ -5,6 +5,7 @@ requires-python = ">=3.10"
 dependencies = [
   "alembic>=1.18.1",
   "argon2-cffi>=25.1.0",
+  "cloudinary>=1.44.1",
   "fastapi>=0.121.0",
   "fastapi-swagger-dark>=0.0.9",
   "httpx>=0.28.1",
@@ -12,7 +13,9 @@ dependencies = [
   "pydantic-settings>=2.12.0",
   "pydantic[email]>=2.12.5",
   "python-jose[cryptography]>=3.5.0",
+  "python-multipart>=0.0.22",
   "requests>=2.32.5",
   "sqlalchemy>=2.0.46",
+  "stripe>=14.3.0",
   "uvicorn>=0.34.0",
 ]

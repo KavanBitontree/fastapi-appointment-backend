@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from typing import Optional
 
 class Settings(BaseSettings):
     NEON_DB_URL: str
@@ -11,6 +12,13 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     CRON_SECRET: str
+    SMTP_SERVER: str
+    SMTP_PORT: int
+    SMTP_USERNAME: str
+    SMTP_PASSWORD: str
+    STRIPE_SECRET_KEY: str
+    PUBLISHABLE_KEY: str
+    STRIPE_WEBHOOK_SECRET: Optional[str] = None
 
     class Config:
         env_file = ".env"

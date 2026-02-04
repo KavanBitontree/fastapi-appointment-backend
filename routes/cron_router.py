@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Header, HTTPException, Depends , Security
 from sqlalchemy.orm import Session
-from datetime import date, timedelta, time, datetime
-import os
+from datetime import date, timedelta, time, datetime, timezone
 from typing import Dict, Any
 from core.security_schemes import bearer_scheme
 from core.cron_security import verify_cron_auth
@@ -10,7 +9,8 @@ from deps import get_db
 from models.doctor import Doctor
 from models.doctor_slot import DoctorSlot
 from models.doctor_availability import DoctorAvailability
-from core.enums import SlotStatus
+from models.appointment import Appointment
+from core.enums import SlotStatus, AppointmentStatus
 from services.slot_generation_service import generate_slots_for_availability
 from core.config import settings
 
@@ -46,11 +46,13 @@ async def daily_slot_maintenance(
     authorized: bool = Depends(verify_cron_secret)
 ) -> Dict[str, Any]:
     """
-    Daily maintenance job for slot management.
+    Daily maintenance job for slot and appointment management.
 
     Tasks:
-    1. Delete past FREE slots (cleanup)
-    2. Create availability + slots for day 30 (rolling window)
+    1. Expire appointments that passed 24-hour approval window (doctor didn't respond)
+    2. Expire appointments that passed 15-minute payment window (patient didn't pay)
+    3. Delete past FREE slots (cleanup)
+    4. Create availability + slots for day 30 (rolling window)
 
     Scheduled: Daily at 00:00 UTC via Vercel Cron or GitHub Actions
 
@@ -60,9 +62,60 @@ async def daily_slot_maintenance(
     try:
         today = date.today()
         day_30 = today + timedelta(days=30)
+        now_utc = datetime.now(timezone.utc)
 
         # ═══════════════════════════════════════
-        # STEP 1: Cleanup Past FREE Slots
+        # STEP 1: Expire Pending Approval Appointments (24-hour window)
+        # ═══════════════════════════════════════
+        expired_approval_appointments = db.query(Appointment).filter(
+            Appointment.status == AppointmentStatus.REQUESTED,
+            Appointment.approval_expires_at.isnot(None),
+            Appointment.approval_expires_at < now_utc
+        ).all()
+        
+        expired_approval_count = 0
+        for appointment in expired_approval_appointments:
+            # Release the slot
+            slot = appointment.slot
+            if slot and slot.status == SlotStatus.BOOKED:
+                slot.status = SlotStatus.FREE
+                slot.held_at = None
+                slot.held_by_patient_id = None
+                slot.held_expires_at = None
+            
+            # Cancel the appointment
+            appointment.status = AppointmentStatus.CANCELLED
+            expired_approval_count += 1
+
+        # ═══════════════════════════════════════
+        # STEP 2: Expire Unpaid Appointments (15-minute payment window)
+        # ═══════════════════════════════════════
+        expired_payment_appointments = db.query(Appointment).filter(
+            Appointment.status == AppointmentStatus.APPROVED,
+            Appointment.payment_expires_at.isnot(None),
+            Appointment.payment_expires_at < now_utc
+        ).all()
+        
+        expired_payment_count = 0
+        for appointment in expired_payment_appointments:
+            # Release the slot
+            slot = appointment.slot
+            if slot and slot.status == SlotStatus.BOOKED:
+                slot.status = SlotStatus.FREE
+                slot.held_at = None
+                slot.held_by_patient_id = None
+                slot.held_expires_at = None
+            
+            # Cancel the appointment
+            appointment.status = AppointmentStatus.CANCELLED
+            expired_payment_count += 1
+
+        # Commit appointment expirations
+        if expired_approval_count > 0 or expired_payment_count > 0:
+            db.commit()
+
+        # ═══════════════════════════════════════
+        # STEP 3: Cleanup Past FREE Slots
         # ═══════════════════════════════════════
         deleted_count = db.query(DoctorSlot).filter(
             DoctorSlot.date < today,
@@ -70,7 +123,7 @@ async def daily_slot_maintenance(
         ).delete(synchronize_session=False)
 
         # ═══════════════════════════════════════
-        # STEP 2: Create Day 30 Availability
+        # STEP 4: Create Day 30 Availability
         # ═══════════════════════════════════════
         doctors = db.query(Doctor).all()
         total_slots_created = 0
@@ -135,12 +188,14 @@ async def daily_slot_maintenance(
         db.commit()
 
         # ═══════════════════════════════════════
-        # STEP 3: Return Statistics
+        # STEP 5: Return Statistics
         # ═══════════════════════════════════════
         return {
             "success": True,
             "timestamp": str(today),
             "maintenance": {
+                "expired_approval_appointments": expired_approval_count,
+                "expired_payment_appointments": expired_payment_count,
                 "deleted_past_slots": deleted_count,
                 "doctors_processed": doctors_processed,
                 "doctors_skipped": skipped_existing,
@@ -148,7 +203,7 @@ async def daily_slot_maintenance(
                 "target_date": str(day_30)
             },
             "errors": errors if errors else None,
-            "message": f"Successfully processed {doctors_processed} doctors"
+            "message": f"Successfully processed {doctors_processed} doctors. Expired {expired_approval_count} approval and {expired_payment_count} payment appointments."
         }
 
     except Exception as e:

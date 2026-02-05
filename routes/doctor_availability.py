@@ -46,7 +46,10 @@ def create_doctor_availability(
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor profile not found")
 
-    return create_availability(db=db, doctor=doctor, payload=payload)
+    result = create_availability(db=db, doctor=doctor, payload=payload)
+    db.commit()
+    db.refresh(result)  # Refresh to get updated data
+    return result
 
 
 @router.patch("/{availability_id}")
@@ -68,12 +71,15 @@ def update_doctor_availability(
     if not availability:
         raise HTTPException(status_code=404, detail="Availability not found")
 
-    return update_availability(
+    result = update_availability(
         db=db,
         availability=availability,
         doctor=availability.doctor,
         payload=payload
     )
+    db.commit()
+    db.refresh(result)
+    return result
 
 
 @router.post("/slots/{slot_id}/block")
@@ -93,7 +99,10 @@ def block_doctor_slot(
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor profile not found")
 
-    return block_slot(db=db, slot_id=slot_id, doctor_id=doctor.id)
+    result = block_slot(db=db, slot_id=slot_id, doctor_id=doctor.id)
+    db.commit()
+    db.refresh(result)  # Refresh to get the updated slot
+    return result
 
 
 @router.post("/slots/{slot_id}/unblock")
@@ -112,7 +121,10 @@ def unblock_doctor_slot(
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor profile not found")
 
-    return unblock_slot(db=db, slot_id=slot_id, doctor_id=doctor.id)
+    result = unblock_slot(db=db, slot_id=slot_id, doctor_id=doctor.id)
+    db.commit()
+    db.refresh(result)
+    return result
 
 
 @router.post("/slots/bulk-block")
@@ -132,11 +144,17 @@ def bulk_block_doctor_slots(
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor profile not found")
 
-    return bulk_block_slots(
+    result = bulk_block_slots(
         db=db,
         slot_ids=payload.slot_ids,
         doctor_id=doctor.id
     )
+    db.commit()
+    # Refresh all affected slots if result is a list
+    if isinstance(result, list):
+        for slot in result:
+            db.refresh(slot)
+    return result
 
 
 @router.get("/slots")

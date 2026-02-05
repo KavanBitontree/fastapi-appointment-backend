@@ -21,7 +21,7 @@ class DoctorsListResponse(BaseModel):
     limit: int
 
 
-@router.get("/", dependencies=[Security(bearer_scheme)],response_model=DoctorsListResponse)
+@router.get("", dependencies=[Security(bearer_scheme)],response_model=DoctorsListResponse)
 def get_all_doctors(
     current_user: dict = Depends(auth_required()),
     db: Session = Depends(get_db),

@@ -62,6 +62,7 @@ async def signup_patient(
     Patient signup endpoint
     - Creates User, Patient, Device, and RefreshToken entries
     - Returns access token in JSON, refresh token in HttpOnly cookie
+    - Sets access token as HttpOnly cookie for server-side Next.js
     - Enforces single-session per user
     """
     # Check if user already exists
@@ -125,7 +126,18 @@ async def signup_patient(
             httponly=True,
             secure=True,
             samesite="lax",
-            max_age=30 * 24 * 60 * 60,
+            max_age=30 * 24 * 60 * 60,  # 30 days
+            path="/"
+        )
+
+        # Set access token as HttpOnly cookie (for server-side Next.js)
+        response.set_cookie(
+            key="access_token",
+            value=access_token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=15 * 60,  # 15 minutes
             path="/"
         )
 
@@ -156,6 +168,8 @@ async def signup_doctor(
     """
     Doctor signup endpoint
     - Creates User, Doctor (with location), Device, RefreshToken
+    - Returns access token in JSON, refresh token in HttpOnly cookie
+    - Sets access token as HttpOnly cookie for server-side Next.js
     - AUTOMATICALLY sets up default availability and slots for next 30 days
     """
 
@@ -230,13 +244,25 @@ async def signup_doctor(
 
         db.commit()
 
+        # Set refresh token as HttpOnly cookie
         response.set_cookie(
             key="refresh_token",
             value=refresh_token_string,
             httponly=True,
             secure=True,
             samesite="lax",
-            max_age=30 * 24 * 60 * 60,
+            max_age=30 * 24 * 60 * 60,  # 30 days
+            path="/"
+        )
+
+        # Set access token as HttpOnly cookie (for server-side Next.js)
+        response.set_cookie(
+            key="access_token",
+            value=access_token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=15 * 60,  # 15 minutes
             path="/"
         )
 

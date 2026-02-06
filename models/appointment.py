@@ -10,7 +10,7 @@ class Appointment(Base):
     id = Column(Integer, primary_key=True, index=True)
     doctor_id = Column(Integer, ForeignKey("doctors.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False, index=True)
     patient_id = Column(Integer, ForeignKey("patients.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False, index=True)
-    slot_id = Column(Integer, ForeignKey("doctor_slots.id", ondelete="RESTRICT", onupdate="CASCADE"), unique=True, nullable=False)
+    slot_id = Column(Integer, ForeignKey("doctor_slots.id", ondelete="RESTRICT", onupdate="CASCADE"), nullable=False , index=True)
     
     status = Column(Enum(AppointmentStatus, name="appointment_status"), nullable=False, default=AppointmentStatus.REQUESTED)
     report = Column(String, nullable=True)  # Cloudinary URL of medical report

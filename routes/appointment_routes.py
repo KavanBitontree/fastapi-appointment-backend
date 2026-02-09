@@ -463,6 +463,29 @@ async def approve_appointment(
     if not appointment:
         raise HTTPException(status_code=404, detail="Appointment not found")
     
+    # Make approval idempotent:
+    # - If already APPROVED, simply return a success-style response instead of error
+    # - Only block other terminal/invalid states
+    if appointment.status == AppointmentStatus.APPROVED:
+        patient = appointment.patient
+        slot = appointment.slot
+
+        # Use existing payment_expires_at if present
+        payment_expiry = appointment.payment_expires_at
+        payment_expiry_ist = (
+            payment_expiry.astimezone(IST) if payment_expiry else None
+        )
+
+        return {
+            "appointment_id": appointment.id,
+            "status": "APPROVED",
+            "message": "Appointment already approved. No further action needed.",
+            "patient_name": patient.name if patient else None,
+            "payment_deadline": payment_expiry_ist.isoformat() if payment_expiry_ist else None,
+            "payment_deadline_formatted": payment_expiry_ist.strftime("%d %B %Y, %I:%M %p IST") if payment_expiry_ist else None,
+            "payment_timeout_minutes": PAYMENT_TIMEOUT_MINUTES,
+        }
+
     if appointment.status != AppointmentStatus.REQUESTED:
         raise HTTPException(
             status_code=400,
@@ -621,88 +644,6 @@ async def reject_appointment(
 
 
 # ─────────────────────────────────────────────────────────────
-# 📊 GET PATIENT'S APPOINTMENTS
-# ─────────────────────────────────────────────────────────────
-@router.get("/my-appointments", dependencies=[Security(bearer_scheme)])
-async def get_my_appointments(
-    status: Optional[str] = None,
-    current_user: dict = Depends(roles_required(UserRole.PATIENT)),
-    db: Session = Depends(get_db)
-):
-    """
-    Get all appointments for current patient.
-    Auto-expires pending appointments before fetching.
-    """
-    
-    # 🔥 Auto-expire old requests
-    expire_pending_approval_appointments_inline(db)
-    expire_unpaid_appointments_inline(db)
-    
-    patient = db.query(Patient).filter(
-        Patient.user_id == current_user["user_id"]
-    ).first()
-    
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient profile not found")
-    
-    query = db.query(Appointment).filter(
-        Appointment.patient_id == patient.id
-    )
-    
-    if status:
-        query = query.filter(Appointment.status == status.upper())
-    
-    appointments = query.order_by(Appointment.created_at.desc()).all()
-    
-    result = []
-    for apt in appointments:
-        slot = apt.slot
-        doctor = apt.doctor
-        
-        # Calculate time remaining for doctor approval (if REQUESTED)
-        approval_time_remaining = None
-        if apt.status == AppointmentStatus.REQUESTED and apt.approval_expires_at:
-            now_utc = datetime.now(timezone.utc)
-            if apt.approval_expires_at > now_utc:
-                remaining = apt.approval_expires_at - now_utc
-                approval_time_remaining = {
-                    "hours": int(remaining.total_seconds() // 3600),
-                    "minutes": int((remaining.total_seconds() % 3600) // 60),
-                    "expires_at": apt.approval_expires_at.astimezone(IST).isoformat()
-                }
-        
-        # Calculate time remaining for payment (if APPROVED)
-        payment_time_remaining = None
-        if apt.status == AppointmentStatus.APPROVED and apt.payment_expires_at:
-            now_utc = datetime.now(timezone.utc)
-            if apt.payment_expires_at > now_utc:
-                remaining = apt.payment_expires_at - now_utc
-                payment_time_remaining = {
-                    "minutes": int(remaining.total_seconds() // 60),
-                    "seconds": int(remaining.total_seconds() % 60),
-                    "expires_at": apt.payment_expires_at.astimezone(IST).isoformat()
-                }
-        
-        result.append({
-            "id": apt.id,
-            "status": apt.status.value,
-            "doctor_name": doctor.name,
-            "specialization": doctor.speciality,
-            "slot_date": slot.date.isoformat(),
-            "slot_time": f"{slot.start_time} - {slot.end_time}",
-            "created_at": apt.created_at.isoformat(),
-            "approval_time_remaining": approval_time_remaining,  # Doctor approval countdown
-            "payment_time_remaining": payment_time_remaining,    # Patient payment countdown
-            "opd_fees": doctor.opd_fees
-        })
-    
-    return {
-        "total": len(result),
-        "appointments": result
-    }
-
-
-# ─────────────────────────────────────────────────────────────
 # 💳 GET APPOINTMENT PAYMENT DETAILS (For payment page)
 # ─────────────────────────────────────────────────────────────
 @router.get("/{appointment_id}/payment-details")
@@ -793,4 +734,238 @@ async def get_payment_details(
         "slot_time": f"{slot.start_time.strftime('%I:%M %p')} - {slot.end_time.strftime('%I:%M %p')}",
         "time_remaining": time_remaining,
         "payment_expires_at": appointment.payment_expires_at.astimezone(IST).isoformat() if appointment.payment_expires_at else None
+    }
+
+
+
+# Add these updated endpoints to your existing appointment_routes.py
+
+# ─────────────────────────────────────────────────────────────
+# 📊 GET PATIENT'S APPOINTMENTS (WITH PAGINATION & SEARCH)
+# ─────────────────────────────────────────────────────────────
+@router.get("/my-appointments", dependencies=[Security(bearer_scheme)])
+async def get_my_appointments(
+    status: Optional[str] = None,
+    search: Optional[str] = None,  # Search by doctor name
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    current_user: dict = Depends(roles_required(UserRole.PATIENT)),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all appointments for current patient with pagination and search.
+    Auto-expires pending appointments before fetching.
+    
+    Query params:
+    - status: Filter by status (REQUESTED, APPROVED, REJECTED, PAID, CANCELLED)
+    - search: Search by doctor name
+    - page: Page number (default: 1)
+    - page_size: Items per page (default: 10, max: 100)
+    """
+    
+    # 🔥 Auto-expire old requests
+    expire_pending_approval_appointments_inline(db)
+    expire_unpaid_appointments_inline(db)
+    
+    patient = db.query(Patient).filter(
+        Patient.user_id == current_user["user_id"]
+    ).first()
+    
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient profile not found")
+    
+    # Base query
+    query = db.query(Appointment).filter(
+        Appointment.patient_id == patient.id
+    )
+    
+    # Apply status filter
+    if status:
+        try:
+            status_enum = AppointmentStatus(status.upper())
+            query = query.filter(Appointment.status == status_enum)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+    
+    # Apply search filter (doctor name)
+    if search:
+        query = query.join(Doctor).filter(
+            Doctor.name.ilike(f"%{search}%")
+        )
+    
+    # Get total count
+    total = query.count()
+    
+    # Calculate pagination
+    total_pages = (total + page_size - 1) // page_size
+    offset = (page - 1) * page_size
+    
+    # Apply pagination and ordering
+    appointments = query.order_by(Appointment.created_at.desc()).offset(offset).limit(page_size).all()
+    
+    result = []
+    for apt in appointments:
+        slot = apt.slot
+        doctor = apt.doctor
+        
+        # Calculate time remaining for doctor approval (if REQUESTED)
+        approval_time_remaining = None
+        if apt.status == AppointmentStatus.REQUESTED and apt.approval_expires_at:
+            now_utc = datetime.now(timezone.utc)
+            if apt.approval_expires_at > now_utc:
+                remaining = apt.approval_expires_at - now_utc
+                approval_time_remaining = {
+                    "hours": int(remaining.total_seconds() // 3600),
+                    "minutes": int((remaining.total_seconds() % 3600) // 60),
+                    "expires_at": apt.approval_expires_at.astimezone(IST).isoformat()
+                }
+        
+        # Calculate time remaining for payment (if APPROVED)
+        payment_time_remaining = None
+        if apt.status == AppointmentStatus.APPROVED and apt.payment_expires_at:
+            now_utc = datetime.now(timezone.utc)
+            if apt.payment_expires_at > now_utc:
+                remaining = apt.payment_expires_at - now_utc
+                payment_time_remaining = {
+                    "minutes": int(remaining.total_seconds() // 60),
+                    "seconds": int(remaining.total_seconds() % 60),
+                    "expires_at": apt.payment_expires_at.astimezone(IST).isoformat()
+                }
+        
+        result.append({
+            "id": apt.id,
+            "status": apt.status.value,
+            "doctor_name": doctor.name,
+            "specialization": doctor.speciality,
+            "slot_date": slot.date.isoformat(),
+            "slot_time": f"{slot.start_time} - {slot.end_time}",
+            "created_at": apt.created_at.isoformat(),
+            "approval_time_remaining": approval_time_remaining,
+            "payment_time_remaining": payment_time_remaining,
+            "opd_fees": doctor.opd_fees,
+            "report": apt.report
+        })
+    
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "appointments": result
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# 📊 GET DOCTOR'S APPOINTMENTS (WITH PAGINATION & SEARCH)
+# ─────────────────────────────────────────────────────────────
+@router.get("/doctor-appointments", dependencies=[Security(bearer_scheme)])
+async def get_doctor_appointments(
+    status: Optional[str] = None,
+    search: Optional[str] = None,  # Search by patient name
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    current_user: dict = Depends(roles_required(UserRole.DOCTOR)),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all appointments for current doctor with pagination and search.
+    Auto-expires pending appointments before fetching.
+    
+    Query params:
+    - status: Filter by status (REQUESTED, APPROVED, REJECTED, PAID, CANCELLED)
+    - search: Search by patient name
+    - page: Page number (default: 1)
+    - page_size: Items per page (default: 10, max: 100)
+    """
+    
+    # 🔥 Auto-expire old requests
+    expire_pending_approval_appointments_inline(db)
+    expire_unpaid_appointments_inline(db)
+    
+    doctor = db.query(Doctor).filter(
+        Doctor.user_id == current_user["user_id"]
+    ).first()
+    
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor profile not found")
+    
+    # Base query
+    query = db.query(Appointment).filter(
+        Appointment.doctor_id == doctor.id
+    )
+    
+    # Apply status filter
+    if status:
+        try:
+            status_enum = AppointmentStatus(status.upper())
+            query = query.filter(Appointment.status == status_enum)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+    
+    # Apply search filter (patient name)
+    if search:
+        query = query.join(Patient).filter(
+            Patient.name.ilike(f"%{search}%")
+        )
+    
+    # Get total count
+    total = query.count()
+    
+    # Calculate pagination
+    total_pages = (total + page_size - 1) // page_size
+    offset = (page - 1) * page_size
+    
+    # Apply pagination and ordering
+    appointments = query.order_by(Appointment.created_at.desc()).offset(offset).limit(page_size).all()
+    
+    result = []
+    for apt in appointments:
+        slot = apt.slot
+        patient = apt.patient
+        patient_user = db.query(User).filter(User.id == patient.user_id).first()
+        
+        # Calculate time remaining for doctor approval (if REQUESTED)
+        approval_time_remaining = None
+        if apt.status == AppointmentStatus.REQUESTED and apt.approval_expires_at:
+            now_utc = datetime.now(timezone.utc)
+            if apt.approval_expires_at > now_utc:
+                remaining = apt.approval_expires_at - now_utc
+                approval_time_remaining = {
+                    "hours": int(remaining.total_seconds() // 3600),
+                    "minutes": int((remaining.total_seconds() % 3600) // 60),
+                    "expires_at": apt.approval_expires_at.astimezone(IST).isoformat()
+                }
+        
+        # Calculate time remaining for payment (if APPROVED)
+        payment_time_remaining = None
+        if apt.status == AppointmentStatus.APPROVED and apt.payment_expires_at:
+            now_utc = datetime.now(timezone.utc)
+            if apt.payment_expires_at > now_utc:
+                remaining = apt.payment_expires_at - now_utc
+                payment_time_remaining = {
+                    "minutes": int(remaining.total_seconds() // 60),
+                    "seconds": int(remaining.total_seconds() % 60),
+                    "expires_at": apt.payment_expires_at.astimezone(IST).isoformat()
+                }
+        
+        result.append({
+            "id": apt.id,
+            "status": apt.status.value,
+            "patient_name": patient.name,
+            "patient_contact": patient_user.email if patient_user else None,
+            "slot_date": slot.date.isoformat(),
+            "slot_time": f"{slot.start_time} - {slot.end_time}",
+            "created_at": apt.created_at.isoformat(),
+            "approval_time_remaining": approval_time_remaining,
+            "payment_time_remaining": payment_time_remaining,
+            "opd_fees": doctor.opd_fees,
+            "report": apt.report
+        })
+    
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "appointments": result
     }

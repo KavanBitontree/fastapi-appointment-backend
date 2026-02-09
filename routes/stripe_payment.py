@@ -81,6 +81,9 @@ async def create_payment_intent(
     """
     
     # Authenticate user (from token or bearer)
+    # NOTE: when the patient comes from an email link we get a `token` query param.
+    # We will also propagate this token to the Stripe success/cancel URLs so that
+    # the verification step can authenticate the same way.
     current_user = await get_user_from_token_or_bearer(request, token, db)
     
     # Verify patient role
@@ -181,6 +184,20 @@ async def create_payment_intent(
             # Use Stripe's minimum (30 minutes) or payment expiry, whichever is later
             stripe_expires_at = max(min_stripe_expiry, appointment.payment_expires_at) if appointment.payment_expires_at else min_stripe_expiry
         
+        # Build success/cancel URLs
+        # If the payment was initiated from an email link we include the same token
+        # so that `/payment/verify` and `/appointments/{id}/payment-details`
+        # can authenticate using the token (even if the patient is not logged in).
+        token_query = f"&token={token}" if token else ""
+        success_url = (
+            f"{settings.FRONTEND_URL}/patient/payment/success"
+            f"?appointment_id={appointment_id}&session_id={{CHECKOUT_SESSION_ID}}{token_query}"
+        )
+        cancel_url = (
+            f"{settings.FRONTEND_URL}/patient/payment"
+            f"?appointment_id={appointment_id}{token_query}"
+        )
+
         # Create Stripe Checkout Session
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=['card'],
@@ -196,8 +213,8 @@ async def create_payment_intent(
                 'quantity': 1,
             }],
             mode='payment',
-            success_url=f"{settings.FRONTEND_URL}/patient/payment/success?appointment_id={appointment_id}&session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{settings.FRONTEND_URL}/patient/payment?appointment_id={appointment_id}",
+            success_url=success_url,
+            cancel_url=cancel_url,
             metadata={
                 'appointment_id': str(appointment_id),
                 'patient_id': str(patient.id),

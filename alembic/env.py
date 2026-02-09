@@ -16,6 +16,7 @@ from models.appointment import Appointment
 from models.doctor_slot import DoctorSlot
 from models.payment import Payment
 from models.doctor_availability import DoctorAvailability
+from models.password_reset_token import PasswordResetToken
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

@@ -7,3 +7,4 @@ from .appointment import Appointment
 from .doctor_slot import DoctorSlot
 from .payment import Payment
 from .doctor_availability import DoctorAvailability
+from .password_reset_token import PasswordResetToken

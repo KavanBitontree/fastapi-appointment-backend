@@ -596,3 +596,291 @@ class EmailService:
         """
         
         return await EmailService.send_email(patient_email, subject, html_content)
+    @staticmethod
+    async def send_password_reset_email(
+        user_email: str,
+        reset_token: str,
+        user_name: str = "User",
+        expiry_minutes: int = 15
+    ) -> bool:
+        """
+        Send password reset email with secure token link
+        
+        Args:
+            user_email: User's email address
+            reset_token: Secure reset token
+            user_name: User's name (optional, defaults to "User")
+            expiry_minutes: Token expiry time in minutes (default: 15)
+            
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        frontend_url = settings.FRONTEND_URL
+        reset_link = f"{frontend_url}/reset-password?token={reset_token}"
+        
+        subject = "Password Reset Request - Healthcare Platform"
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                    line-height: 1.6;
+                    color: #1e293b;
+                    margin: 0;
+                    padding: 0;
+                    background-color: #f8fafc;
+                }}
+                .email-wrapper {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background-color: #ffffff;
+                }}
+                .header {{
+                    background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #334155 100%);
+                    padding: 40px 30px;
+                    text-align: center;
+                    border-radius: 12px 12px 0 0;
+                }}
+                .header h1 {{
+                    margin: 0;
+                    color: #ffffff;
+                    font-size: 28px;
+                    font-weight: 700;
+                    letter-spacing: -0.5px;
+                }}
+                .header-icon {{
+                    font-size: 48px;
+                    margin-bottom: 15px;
+                }}
+                .content {{
+                    padding: 40px 30px;
+                    background-color: #ffffff;
+                }}
+                .greeting {{
+                    font-size: 18px;
+                    color: #0f172a;
+                    margin-bottom: 20px;
+                    font-weight: 500;
+                }}
+                .message {{
+                    font-size: 15px;
+                    color: #475569;
+                    margin-bottom: 25px;
+                    line-height: 1.7;
+                }}
+                .security-notice {{
+                    background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+                    border-left: 4px solid #f59e0b;
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin: 25px 0;
+                }}
+                .security-notice-title {{
+                    color: #92400e;
+                    font-weight: 700;
+                    margin: 0 0 10px 0;
+                    font-size: 16px;
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }}
+                .security-notice-text {{
+                    color: #78350f;
+                    margin: 0;
+                    font-size: 14px;
+                    line-height: 1.6;
+                }}
+                .expiry-info {{
+                    background-color: #fee2e2;
+                    border-left: 4px solid #ef4444;
+                    padding: 15px;
+                    border-radius: 8px;
+                    margin: 20px 0;
+                }}
+                .expiry-info p {{
+                    margin: 0;
+                    color: #991b1b;
+                    font-size: 14px;
+                    font-weight: 600;
+                }}
+                .expiry-time {{
+                    color: #dc2626;
+                    font-weight: 700;
+                    font-size: 18px;
+                    margin-top: 5px;
+                }}
+                .button-container {{
+                    text-align: center;
+                    margin: 35px 0;
+                }}
+                .reset-button {{
+                    display: inline-block;
+                    padding: 16px 40px;
+                    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+                    color: #ffffff !important;
+                    text-decoration: none;
+                    border-radius: 10px;
+                    font-weight: 700;
+                    font-size: 16px;
+                    letter-spacing: 0.5px;
+                    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.4);
+                    transition: all 0.3s ease;
+                }}
+                .reset-button:hover {{
+                    background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+                    transform: translateY(-2px);
+                    box-shadow: 0 6px 20px rgba(15, 23, 42, 0.5);
+                }}
+                .alternative-link {{
+                    background-color: #f1f5f9;
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin: 25px 0;
+                    border: 1px dashed #cbd5e1;
+                }}
+                .alternative-link p {{
+                    margin: 0 0 10px 0;
+                    color: #475569;
+                    font-size: 13px;
+                    font-weight: 600;
+                }}
+                .alternative-link a {{
+                    color: #0f172a;
+                    word-break: break-all;
+                    font-size: 12px;
+                    text-decoration: none;
+                    font-family: monospace;
+                    background-color: #ffffff;
+                    padding: 8px;
+                    border-radius: 4px;
+                    display: block;
+                    border: 1px solid #e2e8f0;
+                }}
+                .help-section {{
+                    background-color: #eff6ff;
+                    border-left: 4px solid #3b82f6;
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin: 25px 0;
+                }}
+                .help-section-title {{
+                    color: #1e40af;
+                    font-weight: 700;
+                    margin: 0 0 10px 0;
+                    font-size: 15px;
+                }}
+                .help-section ul {{
+                    margin: 10px 0;
+                    padding-left: 20px;
+                    color: #1e40af;
+                }}
+                .help-section li {{
+                    margin: 8px 0;
+                    font-size: 14px;
+                    line-height: 1.5;
+                }}
+                .divider {{
+                    height: 1px;
+                    background: linear-gradient(to right, transparent, #e2e8f0, transparent);
+                    margin: 30px 0;
+                }}
+                .footer {{
+                    background-color: #f8fafc;
+                    padding: 30px;
+                    text-align: center;
+                    border-radius: 0 0 12px 12px;
+                    border-top: 1px solid #e2e8f0;
+                }}
+                .footer p {{
+                    margin: 8px 0;
+                    color: #64748b;
+                    font-size: 13px;
+                }}
+                .footer-brand {{
+                    color: #0f172a;
+                    font-weight: 700;
+                    font-size: 14px;
+                    margin-top: 15px;
+                }}
+                .warning-text {{
+                    color: #dc2626;
+                    font-weight: 600;
+                    font-size: 14px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="email-wrapper">
+                <div class="header">
+                    <div class="header-icon">🔐</div>
+                    <h1>Password Reset Request</h1>
+                </div>
+                
+                <div class="content">
+                    <p class="greeting">Hello {user_name},</p>
+                    
+                    <p class="message">
+                        We received a request to reset the password for your Healthcare Platform account. 
+                        If you made this request, click the button below to set a new password.
+                    </p>
+                    
+                    <div class="expiry-info">
+                        <p>⏰ This reset link will expire in:</p>
+                        <p class="expiry-time">{expiry_minutes} minutes</p>
+                    </div>
+                    
+                    <div class="button-container">
+                        <a href="{reset_link}" class="reset-button">Reset My Password</a>
+                    </div>
+                    
+                    <div class="alternative-link">
+                        <p>If the button doesn't work, copy and paste this link into your browser:</p>
+                        <a href="{reset_link}">{reset_link}</a>
+                    </div>
+                    
+                    <div class="security-notice">
+                        <p class="security-notice-title">
+                            <span>⚠️</span>
+                            <span>Security Notice</span>
+                        </p>
+                        <p class="security-notice-text">
+                            <strong>Did not request a password reset?</strong><br>
+                            If you didn't make this request, you can safely ignore this email. 
+                            Your password will remain unchanged and your account is secure. 
+                            However, you may want to change your password as a precaution.
+                        </p>
+                    </div>
+                    
+                    <div class="help-section">
+                        <p class="help-section-title">🛡️ Security Best Practices:</p>
+                        <ul>
+                            <li>Never share your password with anyone</li>
+                            <li>Use a strong, unique password for your account</li>
+                            <li>Enable two-factor authentication if available</li>
+                            <li>Be cautious of phishing emails asking for personal information</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="divider"></div>
+                    
+                    <p class="message" style="margin-top: 25px;">
+                        <span class="warning-text">Important:</span> This is an automated security email. 
+                        For your protection, this link can only be used once and expires in {expiry_minutes} minutes.
+                    </p>
+                </div>
+                
+                <div class="footer">
+                    <p>This email was sent to <strong>{user_email}</strong></p>
+                    <p>If you need assistance, please contact our support team</p>
+                    <p class="footer-brand">Healthcare Platform Security Team</p>
+                    <p style="margin-top: 15px;">© 2026 Healthcare Platform. All rights reserved.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return await EmailService.send_email(user_email, subject, html_content)

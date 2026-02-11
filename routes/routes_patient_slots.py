@@ -14,7 +14,8 @@ from models.doctor import Doctor
 from services.slot_cleanup_service import (
     release_expired_holds,
     delete_unbookable_free_slots,
-    get_booking_window_info
+    get_booking_window_info,
+    fix_slot_appointment_inconsistencies
 )
 
 # Define IST timezone
@@ -69,6 +70,8 @@ async def get_doctor_slots_for_booking(
     - Patients can only book slots ≥ 25 hours away from current time
     - This ensures doctor has 24 hours to approve before appointment time
     """
+
+    fix_slot_appointment_inconsistencies(db)
     
     # 🔥 AUTO-CLEANUP: Release expired holds
     release_expired_holds(db)

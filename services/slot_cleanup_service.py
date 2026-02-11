@@ -21,6 +21,60 @@ MINIMUM_BOOKING_BUFFER_HOURS = 25  # 24h approval + 1h buffer
 
 
 # ═══════════════════════════════════════════════════════════
+# DATA INTEGRITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════
+
+def fix_slot_appointment_inconsistencies(db: Session) -> dict:
+    """
+    Fix data inconsistencies between slots and appointments.
+    
+    Cases handled:
+    1. Slots marked FREE but have active appointments → Mark as BOOKED
+    2. Slots marked BOOKED but have no appointments → Mark as FREE
+    
+    Returns:
+        Dictionary with counts of fixes applied
+    """
+    # Case 1: FREE slots with active appointments
+    free_slots_with_appointments = db.query(DoctorSlot).join(Appointment).filter(
+        DoctorSlot.status == SlotStatus.FREE,
+        Appointment.status.in_([
+            AppointmentStatus.REQUESTED,
+            AppointmentStatus.APPROVED,
+            AppointmentStatus.PAID  # Active appointment statuses
+        ])
+    ).all()
+    
+    fixed_free_to_booked = 0
+    for slot in free_slots_with_appointments:
+        slot.status = SlotStatus.BOOKED
+        fixed_free_to_booked += 1
+    
+    # Case 2: BOOKED slots with no appointments
+    booked_slots_without_appointments = db.query(DoctorSlot).outerjoin(Appointment).filter(
+        DoctorSlot.status == SlotStatus.BOOKED,
+        Appointment.id.is_(None)
+    ).all()
+    
+    fixed_booked_to_free = 0
+    for slot in booked_slots_without_appointments:
+        slot.status = SlotStatus.FREE
+        slot.held_at = None
+        slot.held_by_patient_id = None
+        slot.held_expires_at = None
+        fixed_booked_to_free += 1
+    
+    if fixed_free_to_booked > 0 or fixed_booked_to_free > 0:
+        db.commit()
+    
+    return {
+        "free_to_booked": fixed_free_to_booked,
+        "booked_to_free": fixed_booked_to_free,
+        "total_fixed": fixed_free_to_booked + fixed_booked_to_free
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # ENHANCED SLOT CLEANUP FUNCTIONS
 # ═══════════════════════════════════════════════════════════
 
@@ -56,20 +110,13 @@ def delete_unbookable_free_slots(db: Session) -> int:
     """
     🔥 CRITICAL: Delete FREE slots that are within the 25-hour minimum booking buffer.
     
-    This ensures:
-    1. Patients only see slots they can actually book
-    2. No slots remain that can't receive doctor approval in time
-    3. Database stays clean
-    
-    Deletes:
-    - All past FREE slots
-    - FREE slots within 25 hours from now
+    IMPORTANT: Only deletes slots that have NO appointments associated with them.
+    Uses subquery to avoid SQLAlchemy join+delete limitation.
     
     Returns:
         Number of slots deleted
     """
     now_ist = datetime.now(IST)
-    today_ist = now_ist.date()
     
     # Calculate minimum bookable datetime (25 hours from now)
     min_bookable_datetime = now_ist + timedelta(hours=MINIMUM_BOOKING_BUFFER_HOURS)
@@ -77,51 +124,39 @@ def delete_unbookable_free_slots(db: Session) -> int:
     min_bookable_time = min_bookable_datetime.time()
     
     # ─────────────────────────────────────────────────────────
-    # DELETE 1: All FREE slots from past dates
+    # Find slot IDs that have appointments (to exclude them)
     # ─────────────────────────────────────────────────────────
-    deleted_past_dates = db.query(DoctorSlot).filter(
+    slots_with_appointments = db.query(Appointment.slot_id).filter(
+        Appointment.slot_id.isnot(None)
+    ).distinct().subquery()
+    
+    deleted_count = 0
+    
+    # ─────────────────────────────────────────────────────────
+    # DELETE 1: All FREE slots on dates before min_bookable_date
+    # (but only those WITHOUT appointments)
+    # ─────────────────────────────────────────────────────────
+    deleted_count += db.query(DoctorSlot).filter(
         DoctorSlot.status == SlotStatus.FREE,
-        DoctorSlot.date < today_ist
+        DoctorSlot.date < min_bookable_date,
+        ~DoctorSlot.id.in_(slots_with_appointments)  # NOT IN subquery
     ).delete(synchronize_session=False)
     
     # ─────────────────────────────────────────────────────────
-    # DELETE 2: Today's FREE slots that have passed
+    # DELETE 2: FREE slots on min_bookable_date before min_bookable_time
+    # (but only those WITHOUT appointments)
     # ─────────────────────────────────────────────────────────
-    current_time_ist = now_ist.time()
-    deleted_today_past = db.query(DoctorSlot).filter(
-        DoctorSlot.status == SlotStatus.FREE,
-        DoctorSlot.date == today_ist,
-        DoctorSlot.end_time <= current_time_ist
-    ).delete(synchronize_session=False)
-    
-    # ─────────────────────────────────────────────────────────
-    # DELETE 3: FREE slots within the minimum booking buffer
-    # ─────────────────────────────────────────────────────────
-    # Slots on dates before min_bookable_date
-    deleted_before_buffer = db.query(DoctorSlot).filter(
-        DoctorSlot.status == SlotStatus.FREE,
-        DoctorSlot.date >= today_ist,
-        DoctorSlot.date < min_bookable_date
-    ).delete(synchronize_session=False)
-    
-    # Slots on the min_bookable_date but starting before min_bookable_time
-    deleted_same_date_early = db.query(DoctorSlot).filter(
+    deleted_count += db.query(DoctorSlot).filter(
         DoctorSlot.status == SlotStatus.FREE,
         DoctorSlot.date == min_bookable_date,
-        DoctorSlot.start_time < min_bookable_time
+        DoctorSlot.start_time < min_bookable_time,
+        ~DoctorSlot.id.in_(slots_with_appointments)  # NOT IN subquery
     ).delete(synchronize_session=False)
     
-    total_deleted = (
-        deleted_past_dates + 
-        deleted_today_past + 
-        deleted_before_buffer + 
-        deleted_same_date_early
-    )
-    
-    if total_deleted:
+    if deleted_count > 0:
         db.commit()
     
-    return total_deleted
+    return deleted_count
 
 
 def delete_past_free_slots_legacy(db: Session) -> int:
@@ -194,6 +229,7 @@ def run_all_cleanup_tasks(db: Session) -> dict:
         Dictionary with counts of cleaned items
     """
     results = {
+        "inconsistencies_fixed": fix_slot_appointment_inconsistencies(db),
         "expired_holds_released": release_expired_holds(db),
         "unbookable_slots_deleted": delete_unbookable_free_slots(db),
         "pending_appointments_expired": expire_pending_appointments(db),
@@ -216,12 +252,16 @@ def get_cleanup_statistics(db: Session) -> dict:
     """
     now_utc = datetime.now(timezone.utc)
     now_ist = datetime.now(IST)
-    today_ist = now_ist.date()
     
     # Calculate minimum bookable datetime
     min_bookable_datetime = now_ist + timedelta(hours=MINIMUM_BOOKING_BUFFER_HOURS)
     min_bookable_date = min_bookable_datetime.date()
     min_bookable_time = min_bookable_datetime.time()
+    
+    # Subquery for slots with appointments
+    slots_with_appointments = db.query(Appointment.slot_id).filter(
+        Appointment.slot_id.isnot(None)
+    ).distinct().subquery()
     
     # Count expired holds
     expired_holds = db.query(DoctorSlot).filter(
@@ -229,19 +269,21 @@ def get_cleanup_statistics(db: Session) -> dict:
         DoctorSlot.held_expires_at < now_utc
     ).count()
     
-    # Count unbookable FREE slots (within 25-hour buffer)
-    unbookable_past = db.query(DoctorSlot).filter(
+    # Count unbookable FREE slots (within 25-hour buffer) WITHOUT appointments
+    unbookable_before_date = db.query(DoctorSlot).filter(
         DoctorSlot.status == SlotStatus.FREE,
-        DoctorSlot.date < min_bookable_date
+        DoctorSlot.date < min_bookable_date,
+        ~DoctorSlot.id.in_(slots_with_appointments)
     ).count()
     
     unbookable_same_date = db.query(DoctorSlot).filter(
         DoctorSlot.status == SlotStatus.FREE,
         DoctorSlot.date == min_bookable_date,
-        DoctorSlot.start_time < min_bookable_time
+        DoctorSlot.start_time < min_bookable_time,
+        ~DoctorSlot.id.in_(slots_with_appointments)
     ).count()
     
-    total_unbookable = unbookable_past + unbookable_same_date
+    total_unbookable = unbookable_before_date + unbookable_same_date
     
     # Count pending appointments that should expire
     cutoff_time = now_utc - timedelta(hours=APPOINTMENT_APPROVAL_TIMEOUT_HOURS)
@@ -253,7 +295,7 @@ def get_cleanup_statistics(db: Session) -> dict:
     return {
         "expired_holds_count": expired_holds,
         "unbookable_slots_count": total_unbookable,
-        "unbookable_slots_past": unbookable_past,
+        "unbookable_slots_before_date": unbookable_before_date,
         "unbookable_slots_within_buffer": unbookable_same_date,
         "pending_appointments_to_expire": expired_appointments,
         "minimum_booking_buffer_hours": MINIMUM_BOOKING_BUFFER_HOURS,
@@ -299,12 +341,12 @@ def validate_slot_consistency(db: Session) -> dict:
         Appointment.id.is_(None)
     ).count()
     
-    # Appointments with status REQUESTED/APPROVED but slot is FREE
+    # Appointments with status REQUESTED/APPROVED/PAID but slot is FREE
     mismatched_appointments = db.query(Appointment).join(DoctorSlot).filter(
         Appointment.status.in_([
             AppointmentStatus.REQUESTED,
             AppointmentStatus.APPROVED,
-            AppointmentStatus.CONFIRMED
+            AppointmentStatus.PAID  # Active appointment statuses
         ]),
         DoctorSlot.status == SlotStatus.FREE
     ).count()
@@ -326,6 +368,7 @@ __all__ = [
     "delete_unbookable_free_slots",
     "expire_pending_appointments",
     "run_all_cleanup_tasks",
+    "fix_slot_appointment_inconsistencies",
     
     # Utility functions
     "get_cleanup_statistics",

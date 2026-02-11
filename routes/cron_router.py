@@ -13,6 +13,10 @@ from models.appointment import Appointment
 from core.enums import SlotStatus, AppointmentStatus
 from services.slot_generation_service import generate_slots_for_availability
 from core.config import settings
+from services.slot_cleanup_service import (
+    fix_slot_appointment_inconsistencies,
+    delete_unbookable_free_slots
+)
 
 # Create router for cron jobs
 cron_router = APIRouter(prefix="/api/cron", tags=["Cron Jobs"])
@@ -40,7 +44,7 @@ def verify_cron_secret(authorization: str = Header(None)) -> bool:
     return True
 
 
-@cron_router.get("/daily-maintenance",dependencies=[Security(verify_cron_auth)])
+@cron_router.get("/daily-maintenance", dependencies=[Security(verify_cron_auth)])
 async def daily_slot_maintenance(
     db: Session = Depends(get_db),
     authorized: bool = Depends(verify_cron_secret)
@@ -49,10 +53,11 @@ async def daily_slot_maintenance(
     Daily maintenance job for slot and appointment management.
 
     Tasks:
-    1. Expire appointments that passed 24-hour approval window (doctor didn't respond)
-    2. Expire appointments that passed 15-minute payment window (patient didn't pay)
-    3. Delete past FREE slots (cleanup)
-    4. Create availability + slots for day 30 (rolling window)
+    1. Fix slot-appointment inconsistencies (data integrity)
+    2. Expire appointments that passed 24-hour approval window (doctor didn't respond)
+    3. Expire appointments that passed 15-minute payment window (patient didn't pay)
+    4. Delete unbookable FREE slots (< 25 hours buffer, no appointments)
+    5. Create availability + slots for day 30 (rolling window)
 
     Scheduled: Daily at 00:00 UTC via Vercel Cron or GitHub Actions
 
@@ -63,6 +68,11 @@ async def daily_slot_maintenance(
         today = date.today()
         day_30 = today + timedelta(days=30)
         now_utc = datetime.now(timezone.utc)
+
+        # ═══════════════════════════════════════
+        # STEP 0: Fix Data Inconsistencies
+        # ═══════════════════════════════════════
+        inconsistencies_fixed = fix_slot_appointment_inconsistencies(db)
 
         # ═══════════════════════════════════════
         # STEP 1: Expire Pending Approval Appointments (24-hour window)
@@ -115,12 +125,9 @@ async def daily_slot_maintenance(
             db.commit()
 
         # ═══════════════════════════════════════
-        # STEP 3: Cleanup Past FREE Slots
+        # STEP 3: Delete Unbookable FREE Slots
         # ═══════════════════════════════════════
-        deleted_count = db.query(DoctorSlot).filter(
-            DoctorSlot.date < today,
-            DoctorSlot.status == SlotStatus.FREE
-        ).delete(synchronize_session=False)
+        deleted_count = delete_unbookable_free_slots(db)
 
         # ═══════════════════════════════════════
         # STEP 4: Create Day 30 Availability
@@ -194,16 +201,17 @@ async def daily_slot_maintenance(
             "success": True,
             "timestamp": str(today),
             "maintenance": {
+                "data_integrity": inconsistencies_fixed,
                 "expired_approval_appointments": expired_approval_count,
                 "expired_payment_appointments": expired_payment_count,
-                "deleted_past_slots": deleted_count,
+                "deleted_unbookable_slots": deleted_count,
                 "doctors_processed": doctors_processed,
                 "doctors_skipped": skipped_existing,
                 "new_slots_created": total_slots_created,
                 "target_date": str(day_30)
             },
             "errors": errors if errors else None,
-            "message": f"Successfully processed {doctors_processed} doctors. Expired {expired_approval_count} approval and {expired_payment_count} payment appointments."
+            "message": f"Successfully processed {doctors_processed} doctors. Fixed {inconsistencies_fixed.get('total_fixed', 0)} inconsistencies. Expired {expired_approval_count} approval and {expired_payment_count} payment appointments. Deleted {deleted_count} unbookable slots."
         }
 
     except Exception as e:
@@ -212,7 +220,6 @@ async def daily_slot_maintenance(
             status_code=500,
             detail=f"Daily maintenance failed: {str(e)}"
         )
-
 
 @cron_router.get("/health")
 async def cron_health_check(

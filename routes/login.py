@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, status, Depends, Request, Response
 from sqlalchemy.orm import Session
 import secrets
 import hashlib
+from core.config import settings
 
 from deps import get_db
 from models.user import User
@@ -96,7 +97,6 @@ async def login(
     - Revokes all existing sessions for the user (if force_login=True)
     - Creates new device and session
     - Returns access token in JSON, refresh token in HttpOnly cookie
-    - Sets access token as HttpOnly cookie for server-side Next.js
     """
     # 1. Find user
     user = db.query(User).filter(User.email == request.email).first()
@@ -169,25 +169,17 @@ async def login(
 
         db.commit()
 
+        # Determine if we're in production (HTTPS)
+        is_production = settings.ENV == "production"
+
         # Set refresh token as HttpOnly cookie
         response.set_cookie(
             key="refresh_token",
             value=refresh_token_string,
             httponly=True,
-            secure=True,  # Set to True in production with HTTPS
-            samesite="lax",
+            secure=is_production,  # Only secure in production
+            samesite="none" if is_production else "lax",  # "none" for cross-site in production
             max_age=30 * 24 * 60 * 60,  # 30 days
-            path="/"
-        )
-
-        # Set access token as HttpOnly cookie (for server-side Next.js)
-        response.set_cookie(
-            key="access_token",
-            value=access_token,
-            httponly=True,
-            secure=True,  # Set to True in production with HTTPS
-            samesite="lax",
-            max_age=15 * 60,  # 15 minutes
             path="/"
         )
 
@@ -219,7 +211,7 @@ async def refresh_access_token(
     - Validates refresh token from cookie
     - Checks if token is revoked or expired
     - Issues new access token
-    - Sets new access token as HttpOnly cookie for server-side Next.js
+    - Returns new access token in response body for client-side storage
     """
     # Get refresh token from cookie
     refresh_token_string = request.cookies.get("refresh_token")
@@ -291,17 +283,6 @@ async def refresh_access_token(
     device.last_login_at = datetime.now(timezone.utc)
     db.commit()
 
-    # Set access token as HttpOnly cookie (for server-side Next.js)
-    response.set_cookie(
-        key="access_token",
-        value=access_token,
-        httponly=True,
-        secure=True,  # Set to True in production with HTTPS
-        samesite="lax",
-        max_age=15 * 60,  # 15 minutes
-        path="/"
-    )
-
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -322,7 +303,7 @@ async def logout(
     Logout endpoint
     - Revokes current device's refresh tokens
     - Deactivates current device
-    - Clears refresh token and access token cookies
+    - Clears refresh token cookie
     """
     device_id = current_user.get("device_id")
 
@@ -345,9 +326,8 @@ async def logout(
 
         db.commit()
 
-        # Clear both cookies
+        # Clear refresh token cookie
         response.delete_cookie(key="refresh_token", path="/")
-        response.delete_cookie(key="access_token", path="/")
 
         return MessageResponse(message="Logged out successfully")
 
@@ -370,16 +350,15 @@ async def logout_all_devices(
     Logout from all devices
     - Revokes all refresh tokens for the user
     - Deactivates all devices for the user
-    - Clears refresh token and access token cookies
+    - Clears refresh token cookie
     """
     user_id = current_user.get("user_id")
 
     try:
         revoke_all_user_sessions(user_id, db)
 
-        # Clear both cookies
+        # Clear refresh token cookie
         response.delete_cookie(key="refresh_token", path="/")
-        response.delete_cookie(key="access_token", path="/")
 
         return MessageResponse(message="Logged out from all devices successfully")
 

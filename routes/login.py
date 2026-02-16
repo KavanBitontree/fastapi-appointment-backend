@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, status, Depends, Request, Response
 from sqlalchemy.orm import Session
 import secrets
 import hashlib
+import logging
 from core.config import settings
 
 from deps import get_db
@@ -15,7 +16,27 @@ from schemas.login import LoginRequest, MessageResponse
 
 from core.security_schemes import bearer_scheme
 
+# Configure logging
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+@router.get("/debug-config")
+async def debug_config():
+    """
+    Debug endpoint to check environment configuration
+    Remove this in production after debugging
+    """
+    return {
+        "env": settings.ENV,
+        "is_production": settings.ENV == "production",
+        "frontend_url": settings.FRONTEND_URL,
+        "cookie_settings": {
+            "secure": settings.ENV == "production",
+            "samesite": "none" if settings.ENV == "production" else "lax"
+        }
+    }
 
 
 def create_refresh_token_for_device(user_id: int, device_id: int, db: Session) -> str:
@@ -171,6 +192,9 @@ async def login(
 
         # Determine if we're in production (HTTPS)
         is_production = settings.ENV == "production"
+        
+        logger.info(f"🔍 Login - ENV: {settings.ENV}, is_production: {is_production}")
+        logger.info(f"🔍 Login - Setting cookie with secure={is_production}, samesite={'none' if is_production else 'lax'}")
 
         # Set refresh token as HttpOnly cookie
         response.set_cookie(
@@ -180,7 +204,8 @@ async def login(
             secure=is_production,  # Only secure in production
             samesite="none" if is_production else "lax",  # "none" for cross-site in production
             max_age=30 * 24 * 60 * 60,  # 30 days
-            path="/"
+            path="/",
+            domain=None  # Let browser handle domain
         )
 
         # Return access token in response body (for client-side localStorage)
@@ -213,14 +238,23 @@ async def refresh_access_token(
     - Issues new access token
     - Returns new access token in response body for client-side storage
     """
+    # Debug logging for production
+    logger.info(f"🔍 Refresh endpoint called")
+    logger.info(f"🔍 Cookies received: {list(request.cookies.keys())}")
+    logger.info(f"🔍 Origin: {request.headers.get('origin')}")
+    logger.info(f"🔍 ENV setting: {settings.ENV}")
+    
     # Get refresh token from cookie
     refresh_token_string = request.cookies.get("refresh_token")
 
     if not refresh_token_string:
+        logger.error(f"❌ No refresh_token cookie found")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token not found"
         )
+
+    logger.info(f"✅ Refresh token found in cookie")
 
     # Hash the token to compare with stored hash
     hashed_token = hashlib.sha256(refresh_token_string.encode()).hexdigest()
@@ -230,12 +264,14 @@ async def refresh_access_token(
     ).first()
 
     if not refresh_token:
+        logger.error(f"❌ Invalid refresh token hash")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid refresh token"
         )
 
     if refresh_token.revoked:
+        logger.error(f"❌ Refresh token revoked")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has been revoked. Please login again."
@@ -249,6 +285,7 @@ async def refresh_access_token(
         expires_at = expires_at.replace(tzinfo=timezone.utc)
 
     if expires_at and expires_at < now_utc:
+        logger.error(f"❌ Refresh token expired")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has expired. Please login again."
@@ -256,6 +293,7 @@ async def refresh_access_token(
 
     device = db.query(Device).filter(Device.id == refresh_token.device_id).first()
     if not device or not device.is_active:
+        logger.error(f"❌ Device inactive")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Device is no longer active. Please login again."
@@ -263,6 +301,7 @@ async def refresh_access_token(
 
     user = db.query(User).filter(User.id == refresh_token.user_id).first()
     if not user or not user.is_active:
+        logger.error(f"❌ User inactive")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User account is not active"
@@ -282,6 +321,8 @@ async def refresh_access_token(
     # Update device last login
     device.last_login_at = datetime.now(timezone.utc)
     db.commit()
+
+    logger.info(f"✅ Token refresh successful for user {user.id}")
 
     return {
         "access_token": access_token,

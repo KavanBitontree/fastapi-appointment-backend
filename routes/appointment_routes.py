@@ -351,6 +351,150 @@ async def request_appointment(
 
 
 # ─────────────────────────────────────────────────────────────
+# 🤖 CHATBOT: Request Appointment (Bypasses hold requirement)
+# ─────────────────────────────────────────────────────────────
+@router.post("/bot/request", dependencies=[Security(bearer_scheme)])
+async def bot_request_appointment(
+    slot_id: int,
+    current_user: dict = Depends(roles_required(UserRole.PATIENT)),
+    db: Session = Depends(get_db)
+):
+    """
+    🤖 CHATBOT ENDPOINT: Request appointment without holding slot first.
+    
+    This endpoint is specifically for automated booking bots/assistants.
+    It bypasses the "hold slot" requirement but maintains the approval workflow.
+    
+    Enterprise-level behavior:
+    - Bot requests appointment (doesn't directly book)
+    - Doctor still needs to approve
+    - Maintains all validations (one per day, slot availability)
+    - Goes through normal approval → payment flow
+    
+    Validations:
+    1. Slot must be FREE (not held or booked)
+    2. Patient can only book ONE appointment per day
+    3. Creates appointment with REQUESTED status
+    4. Sets approval_expires_at = now + 24 hours
+    """
+    
+    # 🔥 Auto-expire old pending appointments
+    expire_pending_approval_appointments_inline(db)
+    expire_unpaid_appointments_inline(db)
+    
+    # Get patient
+    patient = db.query(Patient).filter(
+        Patient.user_id == current_user["user_id"]
+    ).first()
+    
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient profile not found")
+    
+    # 🔒 Row lock the slot
+    slot = (
+        db.query(DoctorSlot)
+        .filter(DoctorSlot.id == slot_id)
+        .with_for_update()
+        .first()
+    )
+    
+    if not slot:
+        raise HTTPException(status_code=404, detail="Slot not found")
+    
+    # ✅ Bot-specific validation: Slot must be FREE
+    if slot.status != SlotStatus.FREE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Slot is not available. Current status: {slot.status.value}"
+        )
+    
+    # ✅ VALIDATE: One appointment per day
+    validate_one_appointment_per_day(
+        db=db,
+        patient_id=patient.id,
+        appointment_date=slot.date
+    )
+    
+    # Calculate approval expiry (24 hours for doctor to respond)
+    now_utc = datetime.now(timezone.utc)
+    approval_expiry = now_utc + timedelta(hours=APPOINTMENT_APPROVAL_TIMEOUT_HOURS)
+    
+    # Create appointment with REQUESTED status
+    appointment = Appointment(
+        doctor_id=slot.doctor_id,
+        patient_id=patient.id,
+        slot_id=slot.id,
+        status=AppointmentStatus.REQUESTED,
+        report=None,  # Bot requests don't include reports
+        approval_expires_at=approval_expiry  # ⏰ Doctor has 24 hours
+    )
+    
+    # Update slot status to BOOKED (locked for this appointment)
+    slot.status = SlotStatus.BOOKED
+    slot.held_at = None
+    slot.held_expires_at = None
+    slot.held_by_patient_id = patient.user_id  # Track who booked it
+    
+    db.add(appointment)
+    db.commit()
+    db.refresh(appointment)
+    
+    # Convert to IST for display
+    approval_expiry_ist = approval_expiry.astimezone(IST)
+    
+    # Get doctor details for email
+    doctor = slot.doctor
+    doctor_user = db.query(User).filter(User.id == doctor.user_id).first()
+    patient_user = db.query(User).filter(User.id == patient.user_id).first()
+    
+    # Send email to doctor
+    if doctor_user and patient_user:
+        from models.device import Device
+        doctor_device = db.query(Device).filter(
+            Device.user_id == doctor_user.id,
+            Device.is_active == True
+        ).first()
+        doctor_device_id = doctor_device.id if doctor_device else 0
+        
+        await EmailService.send_appointment_request_to_doctor(
+            doctor_email=doctor_user.email,
+            doctor_name=doctor.name,
+            patient_name=patient.name,
+            patient_age=patient.age if hasattr(patient, 'age') else 0,
+            patient_contact=patient_user.email,
+            appointment_id=appointment.id,
+            slot_date=slot.date.strftime("%d %B %Y"),
+            slot_time=f"{slot.start_time.strftime('%I:%M %p')} - {slot.end_time.strftime('%I:%M %p')}",
+            report_url=None,
+            expiry_time=approval_expiry_ist.strftime("%d %B %Y, %I:%M %p IST"),
+            doctor_user_id=doctor_user.id,
+            doctor_role=doctor_user.role.value,
+            doctor_device_id=doctor_device_id
+        )
+    
+    return {
+        "appointment_id": appointment.id,
+        "status": appointment.status.value,
+        "message": "Appointment request sent to doctor via bot",
+        "approval_deadline": approval_expiry_ist.isoformat(),
+        "approval_deadline_formatted": approval_expiry_ist.strftime("%d %B %Y, %I:%M %p IST"),
+        "timeout_hours": APPOINTMENT_APPROVAL_TIMEOUT_HOURS,
+        "slot_details": {
+            "date": slot.date.isoformat(),
+            "start_time": str(slot.start_time),
+            "end_time": str(slot.end_time),
+            "doctor_name": doctor.name,
+            "specialization": doctor.speciality
+        },
+        "next_steps": [
+            "Doctor will review and approve/reject within 24 hours",
+            "You'll receive email notification when doctor responds",
+            "If approved, you'll have 15 minutes to complete payment"
+        ]
+    }
+
+
+# ─────────────────────────────────────────────────────────────
 # ❌ CANCEL APPOINTMENT (Patient side - with time validation)
 # ─────────────────────────────────────────────────────────────
 @router.post("/{appointment_id}/cancel", dependencies=[Security(bearer_scheme)])

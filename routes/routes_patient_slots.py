@@ -333,3 +333,205 @@ async def get_slots_by_date(
         "doctor_name": doctor.name,
         "booking_window": booking_window
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# 🤖 CHATBOT: Check if patient can book on a specific date
+# ─────────────────────────────────────────────────────────────
+@router.get("/bot/check-availability")
+async def bot_check_date_availability(
+    date: str = Query(..., description="Date to check (YYYY-MM-DD)"),
+    current_user: dict = Depends(roles_required(UserRole.PATIENT)),
+    db: Session = Depends(get_db)
+):
+    """
+    🤖 CHATBOT ENDPOINT: Check if patient can book an appointment on a specific date.
+    
+    This endpoint checks the "one appointment per day" constraint BEFORE showing slots.
+    
+    Returns:
+    - can_book: Boolean indicating if patient can book on this date
+    - reason: Explanation if booking is not allowed
+    - existing_appointment: Details of existing appointment (if any)
+    
+    Use this BEFORE calling /bot/available-slots to avoid showing slots
+    that the patient cannot book anyway.
+    """
+    from models.patient import Patient
+    from models.appointment import Appointment
+    from core.enums import AppointmentStatus
+    
+    # Get patient
+    patient = db.query(Patient).filter(
+        Patient.user_id == current_user["user_id"]
+    ).first()
+    
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient profile not found")
+    
+    # Parse date
+    try:
+        date_obj = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    
+    # Check if date is in the past
+    today = datetime.now(IST).date()
+    if date_obj < today:
+        return {
+            "can_book": False,
+            "date": date,
+            "reason": "Cannot book appointments in the past",
+            "existing_appointment": None
+        }
+    
+    # Check if patient already has an appointment on this date
+    existing = db.query(Appointment).join(DoctorSlot).filter(
+        Appointment.patient_id == patient.id,
+        DoctorSlot.date == date_obj,
+        Appointment.status.in_([
+            AppointmentStatus.REQUESTED,
+            AppointmentStatus.APPROVED,
+            AppointmentStatus.PAID
+        ])
+    ).first()
+    
+    if existing:
+        slot = existing.slot
+        doctor = existing.doctor
+        
+        return {
+            "can_book": False,
+            "date": date,
+            "reason": "You already have an appointment on this date",
+            "existing_appointment": {
+                "id": existing.id,
+                "status": existing.status.value,
+                "doctor_name": doctor.name,
+                "doctor_specialization": doctor.speciality,
+                "slot_time": f"{slot.start_time} - {slot.end_time}",
+                "created_at": existing.created_at.isoformat()
+            }
+        }
+    
+    # Patient can book on this date
+    return {
+        "can_book": True,
+        "date": date,
+        "reason": None,
+        "existing_appointment": None,
+        "message": "You can book an appointment on this date"
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# 🤖 CHATBOT: Get available slots for a date (with validation)
+# ─────────────────────────────────────────────────────────────
+@router.get("/bot/available-slots")
+async def bot_get_available_slots(
+    doctor_id: int = Query(..., description="Doctor ID"),
+    date: str = Query(..., description="Date (YYYY-MM-DD)"),
+    current_user: dict = Depends(roles_required(UserRole.PATIENT)),
+    db: Session = Depends(get_db)
+):
+    """
+    🤖 CHATBOT ENDPOINT: Get available slots for a specific doctor and date.
+    
+    This endpoint:
+    1. Checks if patient already has an appointment on this date
+    2. Returns FREE slots only if patient can book
+    3. Auto-cleans up expired holds and unbookable slots
+    
+    Recommended flow:
+    1. Call /bot/check-availability first
+    2. If can_book=true, call this endpoint
+    3. Show slots to user
+    4. Call /appointments/bot/request to book
+    """
+    from models.patient import Patient
+    from models.appointment import Appointment
+    from core.enums import AppointmentStatus
+    
+    # 🔥 AUTO-CLEANUP
+    release_expired_holds(db)
+    delete_unbookable_free_slots(db)
+    
+    # Get patient
+    patient = db.query(Patient).filter(
+        Patient.user_id == current_user["user_id"]
+    ).first()
+    
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient profile not found")
+    
+    # Verify doctor exists
+    doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    
+    # Parse date
+    try:
+        date_obj = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    
+    # ✅ CHECK: Patient doesn't have appointment on this date
+    existing = db.query(Appointment).join(DoctorSlot).filter(
+        Appointment.patient_id == patient.id,
+        DoctorSlot.date == date_obj,
+        Appointment.status.in_([
+            AppointmentStatus.REQUESTED,
+            AppointmentStatus.APPROVED,
+            AppointmentStatus.PAID
+        ])
+    ).first()
+    
+    if existing:
+        slot = existing.slot
+        existing_doctor = existing.doctor
+        
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "ONE_APPOINTMENT_PER_DAY",
+                "message": f"You already have an appointment on {date}",
+                "existing_appointment": {
+                    "id": existing.id,
+                    "status": existing.status.value,
+                    "doctor_name": existing_doctor.name,
+                    "slot_time": f"{slot.start_time} - {slot.end_time}"
+                }
+            }
+        )
+    
+    # Get FREE slots for this date
+    slots = db.query(DoctorSlot).filter(
+        DoctorSlot.doctor_id == doctor_id,
+        DoctorSlot.date == date_obj,
+        DoctorSlot.status == SlotStatus.FREE
+    ).order_by(DoctorSlot.start_time).all()
+    
+    slots_data = []
+    for slot in slots:
+        slots_data.append({
+            "id": slot.id,
+            "date": slot.date.isoformat(),
+            "start_time": str(slot.start_time),
+            "end_time": str(slot.end_time),
+            "status": slot.status.value
+        })
+    
+    # Add booking window info
+    booking_window = get_booking_window_info()
+    
+    return {
+        "date": date,
+        "doctor_id": doctor_id,
+        "doctor_name": doctor.name,
+        "doctor_specialization": doctor.speciality,
+        "opd_fees": doctor.opd_fees,
+        "total_free_slots": len(slots_data),
+        "slots": slots_data,
+        "booking_window": booking_window,
+        "message": f"Found {len(slots_data)} available slots" if slots_data else "No available slots for this date"
+    }

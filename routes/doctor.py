@@ -116,3 +116,35 @@ def get_doctor_by_id(
         raise HTTPException(status_code=404, detail="Doctor not found")
 
     return doctor
+
+
+
+@router.get("/specialities/list", dependencies=[Security(bearer_scheme)])
+def get_all_specialities(
+    current_user: dict = Depends(auth_required()),
+    db: Session = Depends(get_db)
+):
+    """
+    Get list of unique specialities from all doctors.
+    Useful for chatbot and search filters.
+    """
+    # Check if user has required role
+    user_role = current_user.get("role")
+    allowed_roles = [UserRole.PATIENT.value]
+
+    if user_role not in allowed_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized for this resource"
+        )
+    
+    # Query unique specialities
+    specialities = db.query(Doctor.speciality).distinct().order_by(Doctor.speciality).all()
+    
+    # Extract from tuples
+    speciality_list = [spec[0] for spec in specialities]
+    
+    return {
+        "specialities": speciality_list,
+        "total": len(speciality_list)
+    }

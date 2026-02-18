@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     STRIPE_SECRET_KEY: str
     PUBLISHABLE_KEY: str
     STRIPE_WEBHOOK_SECRET: Optional[str] = None
+    GROQ_API_KEY: str
+    LANGSMITH_TRACING: bool = True
+    LANGSMITH_ENDPOINT: str
+    LANGSMITH_API_KEY: str
+    LANGSMITH_PROJECT: str
 
     class Config:
         env_file = ".env"

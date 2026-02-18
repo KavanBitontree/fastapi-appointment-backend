@@ -11,6 +11,7 @@ from models.user import User
 from models.device import Device
 from models.refresh_token import RefreshToken
 from services.security import verify_password, create_access_token
+from langGraph_service.graph import clear_user_context
 from middlewares.auth import auth_required
 from schemas.login import LoginRequest, MessageResponse
 
@@ -345,8 +346,10 @@ async def logout(
     - Revokes current device's refresh tokens
     - Deactivates current device
     - Clears refresh token cookie
+    - Clears LangGraph conversation history
     """
     device_id = current_user.get("device_id")
+    user_id = current_user.get("user_id")
 
     if not device_id:
         raise HTTPException(
@@ -369,6 +372,10 @@ async def logout(
 
         # Clear refresh token cookie
         response.delete_cookie(key="refresh_token", path="/")
+
+        # Clear LangGraph conversation history
+        if user_id:
+            await clear_user_context(user_id)
 
         return MessageResponse(message="Logged out successfully")
 

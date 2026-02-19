@@ -1,56 +1,76 @@
 """
-LangGraph Main Graph
-Orchestrates the chatbot conversation flow with full multi-turn context awareness.
+LangGraph Main Graph — Supervisor-Worker Pattern
+=================================================
 
-CONTEXT AWARENESS DESIGN:
-- State is TypedDict, so LangGraph merges partial updates (only changed keys overwritten).
-- Before each ainvoke(), we load the latest checkpoint and merge persisted fields
-  (available_slots, doctor_id, date, etc.) into the new message's input.
-- This means "Book slot 1" in turn N+1 can see the slots shown in turn N.
-- thread_id = user_{user_id} for per-user session isolation.
-- AsyncSqliteSaver is fully async — always use aget_state_history, never get_state_history.
+Key fixes vs original:
+  1. add_conditional_edges() from supervisor → all workers + END.
+     This makes the full graph topology visible in PNG/Mermaid visualization.
+     Runtime routing is still driven by Command(goto=...) inside each node —
+     the conditional_edges declaration is the *static* counterpart that
+     LangGraph uses for graph drawing and validation.
 
-GRAPH FLOW:
-  START
-    │
-    ▼
-  classify_intent ──(conditional)──► appointment_handler ─┐
-                                  ► doctor_handler        ─┤──► response_handler ──► END
-                                  ► nearby_doctor_handler ─┤         ▲
-                                  ► profile_handler       ─┘         │
-                                  ► response_handler ────────────────┘
-                                    (greeting/help/out_of_scope)
+  2. Worker nodes no longer declare add_edge(worker, "supervisor") because
+     those edges are also driven by Command(goto="supervisor") at runtime.
+     We keep them as explicit edges so the PNG shows the cycle.
 
-  RUNTIME JUMPS (via Command, shown as dashed in PNG):
-    doctor_handler ──────────────────────────────────────► appointment_handler
-    (when doctor found + date already in context)
+  3. create_react_agent is imported from langgraph.prebuilt (not langchain.agents).
+
+LOOP PROTECTION (two independent limits):
+─────────────────────────────────────────
+1. recursion_limit (in ainvoke config) — total node-execution cap.
+   Set to 50. GraphRecursionError is caught and returned cleanly.
+
+2. max_iterations (in create_react_agent) — per-agent LLM↔tool loop cap.
+   appointment=10, others=4-6. Fires before recursion_limit for single-agent loops.
 """
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.types import RetryPolicy
+from langgraph.errors import GraphRecursionError
 from sqlalchemy.orm import Session
-from functools import partial
-import aiosqlite
 from pathlib import Path
+import aiosqlite
 import traceback
 
-from langGraph_service.schemas.state import ChatbotState
-from langGraph_service.nodes.classifier_node import classify_intent
-from langGraph_service.nodes.appointment_node import appointment_handler
-from langGraph_service.nodes.doctor_node import doctor_handler
-from langGraph_service.nodes.nearby_doctor_node import nearby_doctor_handler
-from langGraph_service.nodes.profile_node import profile_handler
-from langGraph_service.nodes.response_node import response_handler
+from langGraph_service.schemas.state import AgenticState, MESSAGE_HISTORY_LIMIT
+from langGraph_service.nodes.supervisor import make_supervisor, make_supervisor_router
+from langGraph_service.nodes.appointment_agent import make_appointment_agent
+from langGraph_service.nodes.doctor_agent import make_doctor_agent
+from langGraph_service.nodes.nearby_agent import make_nearby_agent
+from langGraph_service.nodes.profile_agent import make_profile_agent
+from langGraph_service.config.llm_init import llm
 
 
-# ── Checkpointer singleton ────────────────────────────────────────────────────
+# ── Loop protection constants ──────────────────────────────────────────────────
+
+GRAPH_RECURSION_LIMIT          = 50
+APPOINTMENT_AGENT_MAX_ITERATIONS = 10
+DOCTOR_AGENT_MAX_ITERATIONS      = 6
+NEARBY_AGENT_MAX_ITERATIONS      = 4
+PROFILE_AGENT_MAX_ITERATIONS     = 4
+
+
+# ── Message trimming node ──────────────────────────────────────────────────────
+
+def trim_messages_node(state: AgenticState) -> dict:
+    """
+    Trim message history to prevent token overflow.
+    Keeps only the last MESSAGE_HISTORY_LIMIT messages.
+    """
+    messages = state.get("messages", [])
+    if len(messages) > MESSAGE_HISTORY_LIMIT:
+        trimmed = messages[-MESSAGE_HISTORY_LIMIT:]
+        print(f"[trim_messages] Trimmed {len(messages)} → {len(trimmed)} messages")
+        return {"messages": trimmed}
+    return {}
+
+
+# ── Checkpointer singleton ─────────────────────────────────────────────────────
 
 _checkpointer_instance: AsyncSqliteSaver | None = None
 
 
 async def get_checkpointer() -> AsyncSqliteSaver:
-    """Lazily create and return the shared AsyncSQLite checkpointer."""
     global _checkpointer_instance
     if _checkpointer_instance is None:
         db_path = Path(__file__).parent.parent / "chat_checkpoints.db"
@@ -59,143 +79,88 @@ async def get_checkpointer() -> AsyncSqliteSaver:
     return _checkpointer_instance
 
 
-# ── Intent router (conditional edge) ─────────────────────────────────────────
+# ── Graph builder ──────────────────────────────────────────────────────────────
 
-def _route_intent(state: ChatbotState) -> str:
+def _build_app(
+    db: Session,
+    patient_id: int,
+    user_id: int,
+    patient_name: str,
+    checkpointer: AsyncSqliteSaver,
+):
     """
-    Reads classification set by classify_intent and returns the next node name.
-    greeting / help / out_of_scope skip domain handlers and go straight to response_handler.
+    Build and compile the supervisor-worker StateGraph.
+
+    Graph edges (static declarations for visualization + validation):
+      START → supervisor
+      supervisor →(conditional)→ appointment_node | doctor_node |
+                                  nearby_node | profile_node | END
+      appointment_node → supervisor   (cycle back)
+      doctor_node      → supervisor
+      nearby_node      → supervisor
+      profile_node     → supervisor
+
+    Runtime routing inside each node uses Command(goto=...) — the conditional
+    edge from supervisor and the explicit back-edges together make the full
+    topology visible in graph.draw_mermaid_png().
     """
-    classification = state.get("classification")
-    intent = classification.intent if classification else "out_of_scope"
+    workflow = StateGraph(AgenticState)
 
-    return {
-        "appointment":    "appointment_handler",
-        "doctor_search":  "doctor_handler",
-        "nearby_doctors": "nearby_doctor_handler",
-        "profile":        "profile_handler",
-        "greeting":       "response_handler",
-        "help":           "response_handler",
-        "out_of_scope":   "response_handler",
-    }.get(intent, "response_handler")
-
-
-# ── Graph builder ─────────────────────────────────────────────────────────────
-
-def _build_app(db: Session, checkpointer: AsyncSqliteSaver):
-    """
-    Build and compile the StateGraph with all nodes bound to the DB session.
-
-    Edge structure:
-      START → classify_intent
-      classify_intent →(conditional)→ [appointment_handler | doctor_handler |
-                                        nearby_doctor_handler | profile_handler |
-                                        response_handler]
-      [all domain handlers] → response_handler   (declared for graph viz/LangSmith)
-      response_handler → END
-
-    Runtime jumps (Command-based, shown as dashed edges in PNG):
-      doctor_handler → appointment_handler  (when doctor found + date in context)
-    """
-    workflow = StateGraph(ChatbotState)
-
-    # ── Nodes ─────────────────────────────────────────────────────────────────
-    workflow.add_node("classify_intent", classify_intent)
-    workflow.add_node(
-        "appointment_handler",
-        partial(appointment_handler, db=db),
-        retry=RetryPolicy(max_attempts=3),
+    # ── Create node functions ──────────────────────────────────────────────────
+    supervisor_node  = make_supervisor(llm)
+    appointment_node = make_appointment_agent(
+        db, patient_id, patient_name,
+        max_iterations=APPOINTMENT_AGENT_MAX_ITERATIONS,
     )
-    workflow.add_node(
-        "doctor_handler",
-        partial(doctor_handler, db=db),
-        retry=RetryPolicy(max_attempts=3),
+    doctor_node = make_doctor_agent(
+        db, patient_name,
+        max_iterations=DOCTOR_AGENT_MAX_ITERATIONS,
     )
-    workflow.add_node(
-        "nearby_doctor_handler",
-        partial(nearby_doctor_handler, db=db),
-        retry=RetryPolicy(max_attempts=3),
+    nearby_node = make_nearby_agent(
+        db, patient_name,
+        max_iterations=NEARBY_AGENT_MAX_ITERATIONS,
     )
-    workflow.add_node(
-        "profile_handler",
-        partial(profile_handler, db=db),
-        retry=RetryPolicy(max_attempts=3),
+    profile_node = make_profile_agent(
+        db, patient_id, user_id, patient_name,
+        max_iterations=PROFILE_AGENT_MAX_ITERATIONS,
     )
-    workflow.add_node("response_handler", response_handler)
 
-    # ── Edges ─────────────────────────────────────────────────────────────────
+    # ── Register nodes ─────────────────────────────────────────────────────────
+    workflow.add_node("trim_messages",    trim_messages_node)
+    workflow.add_node("supervisor",       supervisor_node)
+    workflow.add_node("appointment_node", appointment_node)
+    workflow.add_node("doctor_node",      doctor_node)
+    workflow.add_node("nearby_node",      nearby_node)
+    workflow.add_node("profile_node",     profile_node)
 
-    # Entry point
-    workflow.add_edge(START, "classify_intent")
+    # ── Entry point (trim messages first, then supervisor) ────────────────────
+    workflow.add_edge(START, "trim_messages")
+    workflow.add_edge("trim_messages", "supervisor")
 
-    # Conditional routing from classifier → correct handler
+    # ── Supervisor → workers (conditional — makes edges visible in graph PNG) ──
+    # The router function reads state["route_to"] which supervisor_node sets
+    # before returning Command(goto=...). Both mechanisms must agree.
+    supervisor_router = make_supervisor_router()
     workflow.add_conditional_edges(
-        "classify_intent",
-        _route_intent,
+        "supervisor",
+        supervisor_router,
         {
-            "appointment_handler":   "appointment_handler",
-            "doctor_handler":        "doctor_handler",
-            "nearby_doctor_handler": "nearby_doctor_handler",
-            "profile_handler":       "profile_handler",
-            "response_handler":      "response_handler",  # greeting / help / out_of_scope
+            "appointment_node": "appointment_node",
+            "doctor_node":      "doctor_node",
+            "nearby_node":      "nearby_node",
+            "profile_node":     "profile_node",
+            "__end__":          END,
         },
     )
 
-    # All domain handlers → response_handler
-    # NOTE: nodes use Command(goto="response_handler") internally which takes precedence,
-    # but declaring edges here keeps the graph structure accurate for LangSmith + PNG.
-    for handler in [
-        "appointment_handler",
-        "doctor_handler",
-        "nearby_doctor_handler",
-        "profile_handler",
-    ]:
-        workflow.add_edge(handler, "response_handler")
-
-    # Terminal edge
-    workflow.add_edge("response_handler", END)
+    # ── Workers → supervisor (cycle — visible in graph PNG) ───────────────────
+    for worker in ["appointment_node", "doctor_node", "nearby_node", "profile_node"]:
+        workflow.add_edge(worker, "supervisor")
 
     return workflow.compile(checkpointer=checkpointer)
 
 
-# ── Context loader ────────────────────────────────────────────────────────────
-
-# Fields that should persist across turns so follow-up messages have full context.
-# e.g. "Book slot 1" needs to see available_slots and doctor_id from the prior turn.
-_PERSISTENT_FIELDS = (
-    "doctor_id",
-    "doctor_name",
-    "date",
-    "time",
-    "speciality",
-    "available_slots",
-    "doctors_list",
-    "patient_lat",
-    "patient_lon",
-    "current_step",
-)
-
-
-async def _load_previous_context(app, config: dict) -> dict:
-    """
-    Load the most recent checkpoint for this thread and extract persistent fields.
-    Returns a dict of fields to merge into the new turn's input state.
-    """
-    try:
-        prev_state = await app.aget_state(config)
-        if prev_state and prev_state.values:
-            values = prev_state.values
-            return {
-                k: values[k]
-                for k in _PERSISTENT_FIELDS
-                if k in values and values[k] is not None
-            }
-    except Exception as e:
-        print(f"[LangGraph] Could not load previous context: {e}")
-    return {}
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Public API ─────────────────────────────────────────────────────────────────
 
 async def process_message(
     user_id: int,
@@ -207,32 +172,16 @@ async def process_message(
     patient_lon: float | None = None,
 ) -> dict:
     """
-    Process a patient message through the LangGraph pipeline.
-
-    Context awareness:
-    - Loads persisted state from the previous turn (via checkpointer).
-    - Merges doctor_id, date, available_slots etc. so follow-up messages
-      like 'Book slot 1' work without the user repeating themselves.
-
-    Args:
-        user_id      : User ID — used as thread_id for session isolation.
-        patient_id   : Patient DB ID.
-        patient_name : Patient display name.
-        message      : The user's raw message text.
-        db           : SQLAlchemy session (injected per-request by FastAPI).
-        patient_lat  : Optional latitude for nearby-doctor queries.
-        patient_lon  : Optional longitude for nearby-doctor queries.
-
-    Returns:
-        dict: { response, suggestions, conversation_id }
+    Process a patient message through the supervisor-worker pipeline.
     """
     checkpointer = await get_checkpointer()
-    app = _build_app(db, checkpointer)
+    app = _build_app(db, patient_id, user_id, patient_name, checkpointer)
 
     config = {
         "configurable": {"thread_id": f"user_{user_id}"},
-        "run_name": f"chatbot | user_{user_id} | {patient_name}",
-        "tags": ["chatbot", "healthcare"],
+        "recursion_limit": GRAPH_RECURSION_LIMIT,
+        "run_name": f"aarogya | user_{user_id} | {patient_name}",
+        "tags": ["aarogya", "healthcare", "supervisor-worker"],
         "metadata": {
             "user_id": user_id,
             "patient_id": patient_id,
@@ -240,29 +189,22 @@ async def process_message(
         },
     }
 
-    # ── Load previous context ─────────────────────────────────────────────────
-    previous_context = await _load_previous_context(app, config)
-
-    # Build this turn's input state.
-    # Start with previous context, then overlay current-turn values.
-    input_state: ChatbotState = {
-        # Identity (always required)
+    from langchain_core.messages import HumanMessage as _HumanMessage
+    input_state: AgenticState = {
         "user_id": user_id,
         "patient_id": patient_id,
         "patient_name": patient_name,
-
-        # Current turn — clear response/suggestions/classification each turn
         "current_message": message,
-        "response": None,
-        "suggestions": None,
-        "classification": None,
-        "error": None,
-
-        # Merge in persisted fields from last turn
-        **previous_context,
+        # Seed messages with the user turn so the checkpointer persists it
+        # and the supervisor never sees an empty message list.
+        "messages": [_HumanMessage(content=message)],
+        # Do NOT set response/suggestions to None here — that would clobber
+        # values written by supervisor since there is no reducer for these fields.
+        # They are reset by the supervisor node itself at the start of each turn.
+        "route_to": None,
+        "supervisor_reasoning": None,
     }
 
-    # Override location if freshly provided this turn
     if patient_lat is not None:
         input_state["patient_lat"] = patient_lat
     if patient_lon is not None:
@@ -271,8 +213,30 @@ async def process_message(
     try:
         result = await app.ainvoke(input_state, config=config)
         return {
-            "response": result.get("response", "I'm sorry, I couldn't process that. Please try again."),
-            "suggestions": result.get("suggestions", []),
+            "response": result.get("response") or _extract_response_from_messages(result),
+            "suggestions": result.get("suggestions") or [],
+            "conversation_id": f"conv_{user_id}",
+        }
+
+    except GraphRecursionError:
+        print(
+            f"[LangGraph] GraphRecursionError: recursion_limit={GRAPH_RECURSION_LIMIT} "
+            f"exceeded for user_{user_id}. Message: {message[:80]!r}"
+        )
+        return {
+            "response": (
+                "I got stuck in a loop trying to process your request. "
+                "This can happen with very complex multi-step queries.\n\n"
+                "Please try breaking your request into smaller steps:\n"
+                "1. First find the doctor: 'Find cardiologist'\n"
+                "2. Then book: 'Book slot with Dr. [name] for [date]'"
+            ),
+            "suggestions": [
+                "Find cardiologist",
+                "Show my appointments",
+                "Find doctors near me",
+                "Help",
+            ],
             "conversation_id": f"conv_{user_id}",
         }
 
@@ -288,24 +252,28 @@ async def process_message(
         }
 
 
-async def get_conversation_history(user_id: int) -> list:
-    """
-    Retrieve conversation history for a user from the AsyncSQLite checkpointer.
+def _extract_response_from_messages(result: dict) -> str:
+    """Fallback: extract the last meaningful AIMessage from the messages list."""
+    messages = result.get("messages") or []
+    for msg in reversed(messages):
+        if hasattr(msg, "content") and msg.content:
+            if not (hasattr(msg, "tool_calls") and msg.tool_calls):
+                return msg.content
+    return "I'm sorry, I couldn't process that. Please try again."
 
-    Uses aget_state_history (async generator) — never the sync get_state_history,
-    which raises InvalidStateError with AsyncSqliteSaver from the main event loop thread.
-    """
+
+# ── Conversation history ───────────────────────────────────────────────────────
+
+async def get_conversation_history(user_id: int) -> list:
     try:
-        workflow = StateGraph(ChatbotState)
+        workflow = StateGraph(AgenticState)
         workflow.add_node("_noop", lambda state: {})
         workflow.add_edge(START, "_noop")
 
         checkpointer = await get_checkpointer()
         app = workflow.compile(checkpointer=checkpointer)
-
         config = {"configurable": {"thread_id": f"user_{user_id}"}}
 
-        # ✅ Async generator — required with AsyncSqliteSaver
         state_history = []
         async for checkpoint in app.aget_state_history(config):
             state_history.append(checkpoint)
@@ -313,21 +281,24 @@ async def get_conversation_history(user_id: int) -> list:
         history = []
         for checkpoint in reversed(state_history):
             values = checkpoint.values
+            messages = values.get("messages") or []
 
-            if values.get("current_message"):
-                history.append({
-                    "role": "user",
-                    "content": values["current_message"],
-                    "timestamp": checkpoint.metadata.get("created_at", ""),
-                })
-
-            if values.get("response"):
-                history.append({
-                    "role": "assistant",
-                    "content": values["response"],
-                    "timestamp": checkpoint.metadata.get("created_at", ""),
-                    "suggestions": values.get("suggestions", []),
-                })
+            for msg in messages:
+                from langchain_core.messages import HumanMessage, AIMessage
+                if isinstance(msg, HumanMessage) and msg.content:
+                    history.append({
+                        "role": "user",
+                        "content": msg.content,
+                        "timestamp": checkpoint.metadata.get("created_at", ""),
+                    })
+                elif isinstance(msg, AIMessage) and msg.content:
+                    if not (hasattr(msg, "tool_calls") and msg.tool_calls):
+                        history.append({
+                            "role": "assistant",
+                            "content": msg.content,
+                            "agent": getattr(msg, "name", "assistant"),
+                            "timestamp": checkpoint.metadata.get("created_at", ""),
+                        })
 
         return history
 
@@ -338,9 +309,6 @@ async def get_conversation_history(user_id: int) -> list:
 
 
 async def clear_user_context(user_id: int) -> None:
-    """
-    Delete all checkpointed state for a user (call on logout).
-    """
     try:
         checkpointer = await get_checkpointer()
         thread_id = f"user_{user_id}"

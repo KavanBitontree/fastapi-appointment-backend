@@ -1,0 +1,62 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	supervisor(supervisor)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> supervisor;
+	appointment_node\3a__end__ --> supervisor;
+	doctor_node\3a__end__ --> supervisor;
+	nearby_node\3a__end__ --> supervisor;
+	profile_node\3a__end__ --> supervisor;
+	supervisor -.-> __end__;
+	supervisor -.-> appointment_node\3a__start__;
+	supervisor -.-> doctor_node\3a__start__;
+	supervisor -.-> nearby_node\3a__start__;
+	supervisor -.-> profile_node\3a__start__;
+	subgraph appointment_node
+	appointment_node\3a__start__(<p>__start__</p>)
+	appointment_node\3aagent(agent)
+	appointment_node\3atools(tools)
+	appointment_node\3a__end__(<p>__end__</p>)
+	appointment_node\3a__start__ --> appointment_node\3aagent;
+	appointment_node\3aagent -.-> appointment_node\3a__end__;
+	appointment_node\3aagent -.-> appointment_node\3atools;
+	appointment_node\3atools --> appointment_node\3aagent;
+	end
+	subgraph doctor_node
+	doctor_node\3a__start__(<p>__start__</p>)
+	doctor_node\3aagent(agent)
+	doctor_node\3atools(tools)
+	doctor_node\3a__end__(<p>__end__</p>)
+	doctor_node\3a__start__ --> doctor_node\3aagent;
+	doctor_node\3aagent -.-> doctor_node\3a__end__;
+	doctor_node\3aagent -.-> doctor_node\3atools;
+	doctor_node\3atools --> doctor_node\3aagent;
+	end
+	subgraph nearby_node
+	nearby_node\3a__start__(<p>__start__</p>)
+	nearby_node\3aagent(agent)
+	nearby_node\3atools(tools)
+	nearby_node\3a__end__(<p>__end__</p>)
+	nearby_node\3a__start__ --> nearby_node\3aagent;
+	nearby_node\3aagent -.-> nearby_node\3a__end__;
+	nearby_node\3aagent -.-> nearby_node\3atools;
+	nearby_node\3atools --> nearby_node\3aagent;
+	end
+	subgraph profile_node
+	profile_node\3a__start__(<p>__start__</p>)
+	profile_node\3aagent(agent)
+	profile_node\3atools(tools)
+	profile_node\3a__end__(<p>__end__</p>)
+	profile_node\3a__start__ --> profile_node\3aagent;
+	profile_node\3aagent -.-> profile_node\3a__end__;
+	profile_node\3aagent -.-> profile_node\3atools;
+	profile_node\3atools --> profile_node\3aagent;
+	end
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc

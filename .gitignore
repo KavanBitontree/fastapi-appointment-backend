@@ -10,3 +10,7 @@ __pycache__/
 .env*
 uv.lock
 tests/
+*.md
+*.db
+*.db-shm
+*.db-wal

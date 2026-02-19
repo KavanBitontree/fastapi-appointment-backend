@@ -206,42 +206,52 @@ async def request_appointment_via_bot(
     from core.enums import SlotStatus, AppointmentStatus
     from services.smtp_mail_service import EmailService
 
-    patient = db.query(Patient).filter(Patient.id == patient_id).first()
-    if not patient:
-        return {"success": False, "error": "Patient not found"}
+    try:
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
+        if not patient:
+            return {"success": False, "error": "Patient not found"}
 
-    slot = db.query(DoctorSlot).filter(DoctorSlot.id == slot_id).with_for_update().first()
-    if not slot:
-        return {"success": False, "error": "Slot not found"}
+        slot = db.query(DoctorSlot).filter(DoctorSlot.id == slot_id).with_for_update().first()
+        if not slot:
+            return {"success": False, "error": "Slot not found"}
 
-    if slot.status != SlotStatus.FREE:
-        return {"success": False, "error": f"Slot is not available (status: {slot.status.value})"}
+        if slot.status != SlotStatus.FREE:
+            return {"success": False, "error": f"Slot is not available (status: {slot.status.value})"}
 
-    # Check one-appointment-per-day
-    availability = check_patient_can_book_on_date(db, patient_id, slot.date)
-    if not availability["can_book"]:
-        return {"success": False, "error": availability["reason"], "existing": availability.get("existing")}
+        # Check one-appointment-per-day
+        availability = check_patient_can_book_on_date(db, patient_id, slot.date)
+        if not availability["can_book"]:
+            return {"success": False, "error": availability["reason"], "existing": availability.get("existing")}
+    except Exception as e:
+        db.rollback()
+        print(f"[request_appointment_via_bot] Pre-booking validation error: {type(e).__name__}: {str(e)}")
+        return {"success": False, "error": f"Validation failed: {str(e)}"}
 
-    now_utc = datetime.now(timezone.utc)
-    approval_expiry = now_utc + timedelta(hours=APPOINTMENT_APPROVAL_TIMEOUT_HOURS)
+    try:
+        now_utc = datetime.now(timezone.utc)
+        approval_expiry = now_utc + timedelta(hours=APPOINTMENT_APPROVAL_TIMEOUT_HOURS)
 
-    appointment = Appointment(
-        doctor_id=slot.doctor_id,
-        patient_id=patient.id,
-        slot_id=slot.id,
-        status=AppointmentStatus.REQUESTED,
-        report=None,
-        approval_expires_at=approval_expiry,
-    )
+        appointment = Appointment(
+            doctor_id=slot.doctor_id,
+            patient_id=patient.id,
+            slot_id=slot.id,
+            status=AppointmentStatus.REQUESTED,
+            report=None,
+            approval_expires_at=approval_expiry,
+        )
 
-    slot.status = SlotStatus.BOOKED
-    slot.held_at = None
-    slot.held_expires_at = None
-    slot.held_by_patient_id = patient.user_id
+        slot.status = SlotStatus.BOOKED
+        slot.held_at = None
+        slot.held_expires_at = None
+        slot.held_by_patient_id = patient.user_id
 
-    db.add(appointment)
-    db.commit()
-    db.refresh(appointment)
+        db.add(appointment)
+        db.commit()
+        db.refresh(appointment)
+    except Exception as e:
+        db.rollback()
+        print(f"[request_appointment_via_bot] Database commit error: {type(e).__name__}: {str(e)}")
+        return {"success": False, "error": f"Failed to save appointment: {str(e)}"}
 
     doctor = slot.doctor
     doctor_user = db.query(User).filter(User.id == doctor.user_id).first()

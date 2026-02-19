@@ -1,268 +1,287 @@
 """
-visualize.py
-============
-Generates a PNG of the LangGraph chatbot graph INCLUDING RUNTIME JUMPS.
+visualize.py — LangGraph Native Graph Visualizer
+==================================================
+Fixed version: uses add_conditional_edges() from supervisor to all workers
+so the full topology is visible in draw_mermaid_png().
 
-Why runtime jumps aren't shown by default:
-  LangGraph's draw_mermaid_png() only renders *declared* edges (add_edge /
-  add_conditional_edges). Runtime Command(goto=...) jumps are invisible to it.
-  We fix this by:
-    1. Getting the raw Mermaid string from the compiled graph.
-    2. Injecting the runtime jump edges manually with a distinct orange style.
-    3. Rendering the patched Mermaid string to PNG.
+HOW TO RUN:
+  python langGraph_service/visualize.py
 
-Runtime jumps in this graph:
-  doctor_handler ──► appointment_handler
-    (triggered when doctor found AND date already in context)
+OUTPUT FILES:
+  aarogya_graph_simple.mmd / .png  — top-level view
+  aarogya_graph_xray.mmd  / .png  — xray view (all ReAct internals + tool nodes)
 
-Usage:
-    # From project root:
-    python tests/visualize.py
-
-Output:
-    graph.png  — saved next to this file.
-
-Requirements:
-    pip install playwright
-    playwright install chromium
+For PNG support:
+  pip install playwright && playwright install chromium
 """
 
 import sys
-import asyncio
 from pathlib import Path
+from typing import Annotated, List, Optional, TypedDict
 
-# ── Make project root importable ─────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).parent.parent))
+try:
+    from langgraph.graph import StateGraph, START, END
+    from langgraph.graph.message import add_messages
+    from langgraph.prebuilt import create_react_agent
+    from langgraph.types import Command
+    from langchain_core.tools import tool
+    from langchain_core.messages import BaseMessage, AIMessage
+    from langchain_core.prompts import ChatPromptTemplate
+except ImportError as e:
+    print(f"[visualize] Missing dependency: {e}")
+    print("Install: pip install langgraph langchain langchain-core")
+    sys.exit(1)
 
-import aiosqlite
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from langGraph_service.schemas.state import ChatbotState
+# ── Stub LLM ───────────────────────────────────────────────────────────────────
+def _make_stub_llm():
+    try:
+        from langchain_groq import ChatGroq
+        return ChatGroq(model="llama3-70b-8192", api_key="viz-stub")
+    except Exception:
+        pass
+    try:
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(model="gpt-4o-mini", api_key="viz-stub")
+    except Exception:
+        pass
+    print("[visualize] Install langchain-groq or langchain-openai for the stub LLM.")
+    sys.exit(1)
+
+LLM = _make_stub_llm()
 
 
-# ── Runtime jumps to inject ───────────────────────────────────────────────────
-# These are Command(goto=...) jumps inside nodes — not declared as graph edges.
-# Format: (from_node, to_node, label)
-RUNTIME_JUMPS = [
-    ("doctor_handler", "appointment_handler", "runtime: doctor found + date in ctx"),
+# ── Shared state ───────────────────────────────────────────────────────────────
+class AgenticState(TypedDict, total=False):
+    messages:             Annotated[List[BaseMessage], add_messages]
+    user_id:              int
+    patient_id:           int
+    patient_name:         str
+    current_message:      str
+    route_to:             Optional[str]
+    supervisor_reasoning: Optional[str]
+    patient_lat:          Optional[float]
+    patient_lon:          Optional[float]
+    response:             Optional[str]
+    suggestions:          Optional[List[str]]
+
+
+# ── Stub tools — real names, no DB logic ──────────────────────────────────────
+
+# Appointment
+@tool
+def get_current_date() -> str:
+    """Get today's date in IST as YYYY-MM-DD."""
+    return ""
+
+@tool
+def get_current_datetime() -> str:
+    """Get current IST datetime string."""
+    return ""
+
+@tool
+def check_can_book_on_date(date: str) -> dict:
+    """Check if the patient can book on this date (25-hr rule + one-per-day). Args: date – YYYY-MM-DD."""
+    return {}
+
+@tool
+def search_doctor_by_name(name: str) -> list:
+    """Search doctors by name (partial match). Args: name."""
+    return []
+
+@tool
+def get_free_slots(doctor_id: int, date: str) -> dict:
+    """Get free appointment slots for a doctor on a date. Args: doctor_id, date – YYYY-MM-DD."""
+    return {}
+
+@tool
+def book_slot(slot_id: int) -> dict:
+    """Book a slot after explicit patient confirmation. Args: slot_id."""
+    return {}
+
+@tool
+def get_my_appointments(status_filter: Optional[str] = None) -> list:
+    """Get patient appointment history. Args: status_filter (optional)."""
+    return []
+
+# Doctor
+@tool
+def search_doctor_by_speciality(speciality: str) -> list:
+    """Search doctors by medical speciality. Args: speciality."""
+    return []
+
+@tool
+def list_all_specialities() -> list:
+    """List all available medical specialities."""
+    return []
+
+@tool
+def list_all_doctors(limit: int = 10, skip: int = 0) -> dict:
+    """List all doctors paginated. Args: limit, skip."""
+    return {}
+
+@tool
+def get_doctor_by_id(doctor_id: int) -> dict:
+    """Get doctor details by ID. Args: doctor_id."""
+    return {}
+
+# Nearby
+@tool
+def find_nearby_doctors(
+    patient_lat: float,
+    patient_lon: float,
+    max_distance_km: float = 10.0,
+    speciality: Optional[str] = None,
+) -> list:
+    """Find doctors within radius of patient location. Args: patient_lat, patient_lon, max_distance_km, speciality."""
+    return []
+
+# Profile
+@tool
+def get_patient_profile() -> dict:
+    """Get patient profile: name, DOB, age, email."""
+    return {}
+
+@tool
+def update_patient_name(new_name: str) -> dict:
+    """Update patient display name. Args: new_name."""
+    return {}
+
+@tool
+def update_patient_dob(new_dob: str) -> dict:
+    """Update patient date of birth. Args: new_dob – YYYY-MM-DD."""
+    return {}
+
+
+APPOINTMENT_TOOLS = [
+    get_current_date, get_current_datetime, check_can_book_on_date,
+    search_doctor_by_name, get_free_slots, book_slot, get_my_appointments,
 ]
+DOCTOR_TOOLS  = [search_doctor_by_name, search_doctor_by_speciality,
+                 list_all_specialities, list_all_doctors, get_doctor_by_id]
+NEARBY_TOOLS  = [find_nearby_doctors, list_all_specialities]
+PROFILE_TOOLS = [get_patient_profile, update_patient_name, update_patient_dob]
 
 
-# ── Intent router (mirrors main_graph._route_intent exactly) ─────────────────
+# ── Build stub agents ──────────────────────────────────────────────────────────
+def _agent(tools, system):
+    return create_react_agent(model=LLM, tools=tools, prompt=system)
 
-def _route_intent(state: ChatbotState) -> str:
-    classification = state.get("classification")
-    intent = classification.intent if classification else "out_of_scope"
-    return {
-        "appointment":    "appointment_handler",
-        "doctor_search":  "doctor_handler",
-        "nearby_doctors": "nearby_doctor_handler",
-        "profile":        "profile_handler",
-        "greeting":       "response_handler",
-        "help":           "response_handler",
-        "out_of_scope":   "response_handler",
-    }.get(intent, "response_handler")
+appointment_agent = _agent(APPOINTMENT_TOOLS, "Appointment specialist.")
+doctor_agent      = _agent(DOCTOR_TOOLS,      "Doctor search specialist.")
+nearby_agent      = _agent(NEARBY_TOOLS,      "Nearby doctor specialist.")
+profile_agent     = _agent(PROFILE_TOOLS,     "Profile management specialist.")
 
 
-# ── Graph builder (stub version — no real DB needed) ─────────────────────────
+# ── Stub node wrappers ─────────────────────────────────────────────────────────
+def supervisor_node(state: AgenticState):
+    """Supervisor: route to worker or END."""
+    return Command(
+        update={"route_to": "__end__"},
+        goto=END,
+    )
 
-def _build_visualization_graph(checkpointer: AsyncSqliteSaver):
-    """
-    Mirrors main_graph._build_app() exactly but uses lambda stubs
-    instead of real DB-dependent handlers — no DB session required.
-    """
-    workflow = StateGraph(ChatbotState)
+def _router(state: AgenticState) -> str:
+    """Conditional edge router — reads state['route_to']."""
+    return state.get("route_to", "__end__") or "__end__"
 
-    # Nodes
-    workflow.add_node("classify_intent",       lambda s: s)
-    workflow.add_node("appointment_handler",   lambda s: s)
-    workflow.add_node("doctor_handler",        lambda s: s)
-    workflow.add_node("nearby_doctor_handler", lambda s: s)
-    workflow.add_node("profile_handler",       lambda s: s)
-    workflow.add_node("response_handler",      lambda s: s)
+def _wrap(agent, name):
+    def node(state: AgenticState):
+        result = agent.invoke({"messages": state.get("messages") or []})
+        return Command(
+            update={"messages": [AIMessage(
+                content=result["messages"][-1].content, name=name
+            )]},
+            goto="supervisor",
+        )
+    node.__name__ = name
+    return node
 
-    # Edges — exact mirror of main_graph._build_app()
-    workflow.add_edge(START, "classify_intent")
+appointment_node = _wrap(appointment_agent, "appointment_node")
+doctor_node      = _wrap(doctor_agent,      "doctor_node")
+nearby_node      = _wrap(nearby_agent,      "nearby_node")
+profile_node     = _wrap(profile_agent,     "profile_node")
 
-    workflow.add_conditional_edges(
-        "classify_intent",
-        _route_intent,
+
+# ── Build graph ────────────────────────────────────────────────────────────────
+def build_graph():
+    wf = StateGraph(AgenticState)
+
+    wf.add_node("supervisor",       supervisor_node)
+    wf.add_node("appointment_node", appointment_node)
+    wf.add_node("doctor_node",      doctor_node)
+    wf.add_node("nearby_node",      nearby_node)
+    wf.add_node("profile_node",     profile_node)
+
+    # Entry
+    wf.add_edge(START, "supervisor")
+
+    # ── KEY FIX: add_conditional_edges makes supervisor→worker edges visible ──
+    wf.add_conditional_edges(
+        "supervisor",
+        _router,
         {
-            "appointment_handler":   "appointment_handler",
-            "doctor_handler":        "doctor_handler",
-            "nearby_doctor_handler": "nearby_doctor_handler",
-            "profile_handler":       "profile_handler",
-            "response_handler":      "response_handler",
+            "appointment_node": "appointment_node",
+            "doctor_node":      "doctor_node",
+            "nearby_node":      "nearby_node",
+            "profile_node":     "profile_node",
+            "__end__":          END,
         },
     )
 
-    for handler in [
-        "appointment_handler",
-        "doctor_handler",
-        "nearby_doctor_handler",
-        "profile_handler",
-    ]:
-        workflow.add_edge(handler, "response_handler")
+    # Workers cycle back to supervisor
+    for w in ["appointment_node", "doctor_node", "nearby_node", "profile_node"]:
+        wf.add_edge(w, "supervisor")
 
-    workflow.add_edge("response_handler", END)
-
-    return workflow.compile(checkpointer=checkpointer)
+    return wf.compile()
 
 
-# ── Mermaid patcher ───────────────────────────────────────────────────────────
+# ── Render ─────────────────────────────────────────────────────────────────────
+def render(output_dir: str = "."):
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
-def _inject_runtime_jumps(mermaid_str: str, jumps: list[tuple[str, str, str]]) -> str:
-    """
-    Injects runtime jump edges into the raw Mermaid diagram string.
+    print("[visualize] Building graph topology...")
+    app = build_graph()
 
-    - Uses dashed orange arrows  (-.->) to distinguish from declared edges.
-    - linkStyle overrides color them orange so they stand out visually.
+    simple_graph = app.get_graph()
+    xray_graph   = app.get_graph(xray=True)
 
-    Args:
-        mermaid_str : Raw Mermaid string from app.get_graph().draw_mermaid()
-        jumps       : List of (from_node, to_node, label) tuples
+    # Mermaid DSL
+    for name, g in [("simple", simple_graph), ("xray", xray_graph)]:
+        mmd = g.draw_mermaid()
+        path = out / f"aarogya_graph_{name}.mmd"
+        path.write_text(mmd)
+        print(f"\n{'='*64}")
+        print(f"MERMAID ({name.upper()}) -> {path}")
+        print(f"{'='*64}")
+        print(mmd)
 
-    Returns:
-        Patched Mermaid string.
-    """
-    if not jumps:
-        return mermaid_str
+    # PNG via playwright
+    png_ok = False
+    for name, g in [("simple", simple_graph), ("xray", xray_graph)]:
+        try:
+            png_bytes = g.draw_mermaid_png()
+            path = out / f"aarogya_graph_{name}.png"
+            path.write_bytes(png_bytes)
+            print(f"[visualize] PNG saved -> {path}")
+            png_ok = True
+        except Exception as e:
+            print(f"[visualize] PNG ({name}) failed: {e}")
 
-    lines = mermaid_str.strip().splitlines()
+    if not png_ok:
+        print("\nPNG generation requires playwright:")
+        print("  pip install playwright && playwright install chromium")
+        print("Alternatively paste the .mmd files at: https://mermaid.live")
 
-    # Count existing edge lines to know linkStyle indices for our injected edges
-    existing_edge_count = sum(
-        1 for line in lines
-        if ("-->" in line or "-.->" in line or "==>" in line)
-        and not line.strip().startswith("%%")
-    )
-
-    # Build jump edge lines (dashed arrow with label)
-    jump_lines = [
-        "",
-        "    %% ── Runtime Jumps (Command-based) — shown in orange ──────────────────",
-    ]
-    for from_node, to_node, label in jumps:
-        jump_lines.append(f'    {from_node} -.->|"{label}"| {to_node}')
-
-    # Build linkStyle overrides to color runtime jump edges orange
-    style_lines = []
-    for i in range(len(jumps)):
-        edge_idx = existing_edge_count + i
-        style_lines.append(
-            f"    linkStyle {edge_idx} stroke:#ff6b00,stroke-width:2.5px,stroke-dasharray:8"
-        )
-
-    # Find insertion point: just before classDef lines or at end
-    insert_at = len(lines)
-    for i, line in enumerate(lines):
-        if line.strip().startswith("classDef") or line.strip().startswith("class "):
-            insert_at = i
-            break
-
-    patched = lines[:insert_at] + jump_lines + [""] + style_lines + [""] + lines[insert_at:]
-    return "\n".join(patched)
-
-
-# ── PNG renderer ──────────────────────────────────────────────────────────────
-
-async def _render_mermaid_to_png(mermaid_str: str) -> bytes:
-    """
-    Renders a Mermaid diagram string to PNG bytes using Playwright.
-    Falls back to LangGraph's built-in renderer if Playwright unavailable.
-    """
+    print("\n[visualize] ASCII graph (simple):")
     try:
-        from playwright.async_api import async_playwright
+        simple_graph.print_ascii()
+    except Exception:
+        print("  (not available in this langgraph version)")
 
-        html = f"""<!DOCTYPE html>
-<html>
-<head>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-  <style>
-    body {{ margin: 20px; background: white; }}
-    .mermaid {{ font-family: sans-serif; }}
-  </style>
-</head>
-<body>
-  <div class="mermaid">{mermaid_str}</div>
-  <script>
-    mermaid.initialize({{
-      startOnLoad: true,
-      theme: 'default',
-      flowchart: {{ curve: 'basis', padding: 20 }},
-    }});
-  </script>
-</body>
-</html>"""
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            page = await browser.new_page(viewport={"width": 1400, "height": 900})
-            await page.set_content(html)
-            await page.wait_for_timeout(2500)  # let Mermaid render
-
-            # Try to screenshot just the SVG element for a tight crop
-            svg = await page.query_selector(".mermaid svg")
-            if svg:
-                png_bytes = await svg.screenshot(type="png")
-            else:
-                png_bytes = await page.screenshot(full_page=True, type="png")
-
-            await browser.close()
-            return png_bytes
-
-    except ImportError:
-        print("⚠️  Playwright not found. Install with:")
-        print("    pip install playwright && playwright install chromium")
-        print("⚠️  Falling back to LangGraph's built-in renderer (no runtime jumps in PNG)...")
-        return None
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-async def main():
-    output_path = Path(__file__).parent / "graph.png"
-
-    # Build graph
-    db_path = Path(__file__).parent.parent / "chat_checkpoints.db"
-    conn = await aiosqlite.connect(str(db_path))
-    checkpointer = AsyncSqliteSaver(conn)
-    app = _build_visualization_graph(checkpointer)
-
-    graph_obj = app.get_graph()
-
-    # Get raw Mermaid string
-    raw_mermaid = graph_obj.draw_mermaid()
-    print("── Raw Mermaid ─────────────────────────────────────────────────────")
-    print(raw_mermaid)
-
-    # Inject runtime jumps
-    patched_mermaid = _inject_runtime_jumps(raw_mermaid, RUNTIME_JUMPS)
-    print("\n── Patched Mermaid (with runtime jumps) ────────────────────────────")
-    print(patched_mermaid)
-
-    # Render to PNG
-    png_bytes = await _render_mermaid_to_png(patched_mermaid)
-
-    if png_bytes is None:
-        # Playwright unavailable — fall back to LangGraph's own renderer (no jumps)
-        png_bytes = graph_obj.draw_mermaid_png()
-
-    output_path.write_bytes(png_bytes)
-
-    print(f"\n✅ Graph saved → {output_path.resolve()}")
-    print(
-        "\n📌 Legend:\n"
-        "  Solid arrows   (──►)  = declared graph edges\n"
-        "  Dashed arrows  (-.-►) = conditional routing from classify_intent\n"
-        "  Orange dashed  (-.-►) = runtime Command jumps\n"
-        "                          e.g. doctor_handler → appointment_handler\n"
-        "                          when doctor found + date already in context\n"
-    )
-
-    await conn.close()
+    print(f"\n[visualize] Done. Output in: {out.resolve()}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    render(sys.argv[1] if len(sys.argv) > 1 else ".")

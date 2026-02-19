@@ -1,6 +1,12 @@
 """
 Chat API Routes — Aarogya Assistant (AA)
 Patients interact with the LangGraph-powered chatbot here.
+
+Architecture: Supervisor-Worker (Blog Pattern)
+  - Supervisor routes to specialist agents
+  - Each agent runs a full ReAct loop (LLM decides which tools to call)
+  - Agents return control to supervisor after completing their task
+  - Supervisor chains agents or finishes
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Security
@@ -29,7 +35,7 @@ router = APIRouter(
 class ChatMessage(BaseModel):
     message: str
     conversation_id: Optional[str] = None
-    # Optional: patient can share location for 'nearby doctors' feature
+    # Optional: patient shares location for 'nearby doctors' feature
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
@@ -49,18 +55,17 @@ async def chat_with_assistant(
     """
     🤖 Aarogya Assistant (AA) — Main chat endpoint.
 
-    **Capabilities:**
-    - 📅 Book & view appointments (auto-requests to doctor)
-    - 🔍 Find doctors by name, specialization
-    - 📍 Find nearby doctors (send latitude & longitude)
-    - 👤 View & update patient profile (name, date of birth)
+    **Architecture: Supervisor-Worker Pattern**
 
-    **Edge cases handled:**
-    - Today's rule: appointments need 25hrs advance booking
-    - One appointment per day
-    - Day-name ambiguity (which Monday?)
-    - Time-only requests without date
-    - Out-of-scope questions
+    The supervisor routes your message to the correct specialist agent:
+    - 📅 **Appointment Agent** — Book, view, cancel appointments; check slot availability
+    - 🔍 **Doctor Agent** — Search doctors by name or specialization
+    - 📍 **Nearby Agent** — Find doctors near your location (send latitude & longitude)
+    - 👤 **Profile Agent** — View and update your patient profile
+
+    Each agent runs a full ReAct loop: the LLM autonomously decides which tools
+    to call, reads the results, and continues until it has a complete answer.
+    The supervisor then decides if another agent is needed or the query is done.
 
     **Nearby doctors:**
     Pass `latitude` and `longitude` in the request body to enable location-based search.
@@ -103,7 +108,7 @@ async def get_chat_suggestions(
             "Show me cardiologist doctors",
             "Find doctors near me",
             "Check my appointment status",
-            "Book appointment with Dr. Smith",
+            "Book appointment with Dr. Sharma",
             "Find dermatologist near me",
             "View my profile",
             "Update my name",
@@ -133,6 +138,7 @@ async def get_chat_history(
     """
     Get conversation history for the current user.
     Uses LangGraph AsyncSQLite checkpointer.
+    Returns all human messages and agent responses in chronological order.
     """
     try:
         history = await get_conversation_history(current_user["user_id"])

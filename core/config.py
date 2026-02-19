@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     LANGSMITH_ENDPOINT: str
     LANGSMITH_API_KEY: str
     LANGSMITH_PROJECT: str
+    OPENROUTER_API_KEY: str
 
     class Config:
         env_file = ".env"

@@ -1,0 +1,26 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	supervisor(supervisor)
+	appointment_node(appointment_node)
+	doctor_node(doctor_node)
+	nearby_node(nearby_node)
+	profile_node(profile_node)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> supervisor;
+	appointment_node --> supervisor;
+	doctor_node --> supervisor;
+	nearby_node --> supervisor;
+	profile_node --> supervisor;
+	supervisor -.-> __end__;
+	supervisor -.-> appointment_node;
+	supervisor -.-> doctor_node;
+	supervisor -.-> nearby_node;
+	supervisor -.-> profile_node;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc

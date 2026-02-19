@@ -1,104 +1,76 @@
 """
-LangGraph Shared State
-Uses TypedDict (not Pydantic BaseModel) so LangGraph can properly merge
-partial state updates across conversation turns via its reducer mechanism.
+LangGraph Shared State — Agentic Architecture
+Uses messages list as the primary communication backbone (LangChain standard).
+add_messages reducer appends new messages instead of replacing the whole list,
+so every node in the graph sees the full conversation history.
 
-FIX — INVALID_CONCURRENT_GRAPH_UPDATE on current_step:
-  When classify_intent uses Command(goto=handler), both nodes run in the same
-  LangGraph super-step. If both write to current_step, LangGraph crashes with
-  INVALID_CONCURRENT_GRAPH_UPDATE because TypedDict keys are single-writer by default.
+Identity fields (user_id, patient_id, patient_name) are set once per session
+and persisted by the AsyncSqliteSaver checkpointer across turns.
 
-  Solution: Annotate current_step with a reducer function (_keep_last).
-  This tells LangGraph HOW to merge concurrent writes instead of crashing.
-  _keep_last simply takes the newest value — whichever node wrote last wins.
+route_to is set by the supervisor and read by the graph's conditional edge
+to decide which specialist agent to invoke.
 
-  This is the correct, idiomatic LangGraph fix. No node files need changing.
+MESSAGE TRIMMING: Configured to keep last 20 messages (10 turns) to prevent
+token overflow and maintain reasonable context window.
 """
 
-from typing import Annotated, Optional, List, Dict, Any, TypedDict
-from pydantic import BaseModel, Field
+from typing import Annotated, Optional, List, TypedDict
+from langchain_core.messages import BaseMessage, trim_messages
+from langgraph.graph.message import add_messages
 
 
-def _keep_last(old: Any, new: Any) -> Any:
+# Configure message trimming to keep last 20 messages (10 user + 10 assistant turns)
+# This prevents token overflow while maintaining sufficient context
+MESSAGE_HISTORY_LIMIT = 20  # Adjust this value as needed (10, 20, 30, etc.)
+
+
+def trim_message_history(messages: List[BaseMessage]) -> List[BaseMessage]:
     """
-    Reducer for fields that may be written by multiple nodes in the same super-step.
-    Takes the newest value. 'new' is None only if a node explicitly sets it to None,
-    in which case we preserve the old value to avoid losing context.
+    Trim message history to keep only recent messages.
+    Keeps the last MESSAGE_HISTORY_LIMIT messages.
     """
-    if new is None:
-        return old
-    return new
+    if len(messages) <= MESSAGE_HISTORY_LIMIT:
+        return messages
+    return messages[-MESSAGE_HISTORY_LIMIT:]
 
 
-class IntentClassification(BaseModel):
-    """Structured output from the classifier node."""
-    intent: str = Field(
-        description="One of: appointment, doctor_search, nearby_doctors, profile, greeting, help, out_of_scope"
-    )
-    confidence: float = Field(default=0.8)
-    entities: Optional[Dict[str, Any]] = Field(default=None)
-    summary: str = Field(default="")
-    reasoning: str = Field(default="")
+class AgenticState(TypedDict, total=False):
 
+    # ── Conversation history ───────────────────────────────────────────────────
+    # add_messages is LangGraph's built-in reducer: new messages are APPENDED,
+    # not replaced. This gives every agent full conversation context.
+    messages: Annotated[List[BaseMessage], add_messages]
 
-class ChatbotState(TypedDict, total=False):
-    """
-    Shared state for the LangGraph chatbot.
-
-    WHY TypedDict instead of Pydantic BaseModel?
-    - LangGraph merges state updates between nodes using dict-style partial updates.
-    - With BaseModel, ainvoke() replaces the whole state, losing context from prior turns.
-    - With TypedDict, only the keys explicitly returned by a node are updated; the rest
-      carry over from the previous checkpoint automatically.
-
-    This means available_slots, doctor_id, date etc. set in turn N
-    are still available when the user follows up in turn N+1 ("Book slot 1").
-
-    WHY Annotated on current_step (and response/suggestions)?
-    - classify_intent and the destination handler both run in the same super-step
-      when Command(goto=...) is used.
-    - Both nodes write current_step → LangGraph crashes without a reducer.
-    - Annotated[type, _keep_last] registers a merge function so concurrent writes
-      are resolved by taking the newest value instead of raising an error.
-    """
-
-    # ── Identity (required on first message, persisted via checkpointer) ─────
+    # ── Patient identity (set once, persisted by checkpointer) ───────────────
     user_id: int
     patient_id: int
     patient_name: str
 
-    # ── Current turn ──────────────────────────────────────────────────────────
+    # ── Current turn raw input ────────────────────────────────────────────────
     current_message: str
-    # response and suggestions are also annotated because response_handler
-    # writes them after another handler already wrote them in some code paths.
-    response: Annotated[Optional[str], _keep_last]
-    suggestions: Annotated[Optional[List[str]], _keep_last]
 
-    # ── Classification (set by classifier each turn) ──────────────────────────
-    classification: Optional[IntentClassification]
+    # ── Supervisor routing ────────────────────────────────────────────────────
+    # Supervisor sets this; conditional edge reads it to pick the next agent.
+    route_to: Optional[str]   # "appointment" | "doctor" | "nearby" | "profile" | "FINISH"
+    supervisor_reasoning: Optional[str]
 
-    # ── Extracted entities ────────────────────────────────────────────────────
-    # These PERSIST across turns — "Book slot 1" can still see the date/doctor
-    # that was set in the previous "Show slots for Dr. X on Y" turn.
-    date: Optional[str]           # YYYY-MM-DD
-    time: Optional[str]           # HH:MM 24hr
-    speciality: Optional[str]
-    doctor_name: Optional[str]
-    doctor_id: Optional[int]
-
-    # ── Patient location ──────────────────────────────────────────────────────
+    # ── Location (for nearby-doctor queries) ─────────────────────────────────
     patient_lat: Optional[float]
     patient_lon: Optional[float]
 
-    # ── Conversation step tracking ─────────────────────────────────────────────
-    # Annotated with _keep_last — both classifier and handler write this field
-    # in the same super-step, which would crash without a reducer.
-    current_step: Annotated[Optional[str], _keep_last]
+    # ── Appointment booking cache (avoids re-running slot discovery on confirmation) ──
+    # Set by appointment_node when slots are presented; cleared after booking.
+    pending_slot_id: Optional[int]          # slot_id the user is about to confirm
+    pending_doctor_name: Optional[str]      # for confirmation message
+    pending_slot_date: Optional[str]        # YYYY-MM-DD
+    pending_slot_time: Optional[str]        # "HH:MM - HH:MM"
 
-    # ── Payload caches (persist so follow-up messages can reference them) ─────
-    available_slots: Optional[List[Dict[str, Any]]]   # Slots shown in previous turn
-    doctors_list: Optional[List[Dict[str, Any]]]
-    profile_data: Optional[Dict[str, Any]]
+    # ── Final API response fields (populated by response_formatter) ───────────
+    response: Optional[str]
+    suggestions: Optional[List[str]]
 
-    # ── Error tracking ────────────────────────────────────────────────────────
-    error: Optional[str]
+    # ── Multi-task coordination (for parallel task handling) ──────────────────
+    multi_task_mode: Optional[bool]                 # True if handling multiple tasks
+    task_decomposition: Optional[dict]              # Decomposed tasks from task_decomposer
+    current_task: Optional[dict]                    # Currently executing task
+    completed_tasks: Optional[List[str]]            # List of completed task descriptions

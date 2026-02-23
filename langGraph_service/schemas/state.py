@@ -68,9 +68,3 @@ class AgenticState(TypedDict, total=False):
     # ── Final API response fields (populated by response_formatter) ───────────
     response: Optional[str]
     suggestions: Optional[List[str]]
-
-    # ── Multi-task coordination (for parallel task handling) ──────────────────
-    multi_task_mode: Optional[bool]                 # True if handling multiple tasks
-    task_decomposition: Optional[dict]              # Decomposed tasks from task_decomposer
-    current_task: Optional[dict]                    # Currently executing task
-    completed_tasks: Optional[List[str]]            # List of completed task descriptions

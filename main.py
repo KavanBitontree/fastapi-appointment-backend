@@ -3,7 +3,7 @@ import fastapi_swagger_dark as fsd
 from sqlalchemy import text
 from core.database import engine
 from core.config import settings
-from routes import signup, login, doctor, patient , doctor_availability , cron_router, routes_patient_slots , appointment_routes, stripe_payment , doctor_calendar , doctor_analytics , forgot_password , profile, chat
+from routes import signup, login, doctor, patient , doctor_availability , cron_router, routes_patient_slots , appointment_routes, stripe_payment , doctor_calendar , doctor_analytics , forgot_password , profile, chat , bot_profile, bot_doctors, bot_nearby, bot_appointments , bot_test , web_socket_test
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(docs_url=None)
@@ -38,6 +38,14 @@ app.include_router(doctor_analytics.router)
 app.include_router(forgot_password.router)
 app.include_router(profile.router)
 app.include_router(chat.router)
+app.include_router(bot_profile.router)
+app.include_router(bot_doctors.router)
+app.include_router(bot_nearby.router)
+app.include_router(bot_appointments.router)
+app.include_router(bot_test.router)
+app.include_router(web_socket_test.router)
+
+
 
 
 @app.get("/")

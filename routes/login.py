@@ -186,7 +186,7 @@ async def login(
                 "role": user.role.value,
                 "device_id": device.id
             },
-            expires_minutes=15
+            expires_minutes=180  # 3 hours
         )
 
         db.commit()
